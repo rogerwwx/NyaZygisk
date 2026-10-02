@@ -3,6 +3,10 @@ typeattribute zygisk_file mlstrustedobject
 allow domain zygisk_file dir {search getattr}
 allow domain zygisk_file sock_file {read write getattr open}
 
+# The daemon control socket is created with sockcreate=u:r:zygote:s0.
+# Native artd modules need this peer-socket permission in addition to the path permissions.
+allow artd zygote unix_stream_socket connectto
+
 allow zygote magisk lnk_file read
 allow zygote unlabeled file {read open}
 allow zygote zygote capability sys_chroot
