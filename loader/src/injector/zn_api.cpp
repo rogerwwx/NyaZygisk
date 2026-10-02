@@ -1,5 +1,4 @@
 #include "zn_api.hpp"
-#include "zn_targets.hpp"
 #include "daemon.hpp"
 
 #include "elf_util.h"
@@ -458,12 +457,6 @@ const ZygiskNextAPI* getApiForVersion(int target_api_version) {
     if (target_api_version >= 4) return &kApiV4;
     if (target_api_version >= 2) return &kApiFull;
     return &kApiNoSymbolResolver;
-}
-
-bool isArtD() {
-    char path[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
-    return n > 0 && isArtDPath(std::string_view(path, static_cast<size_t>(n)));
 }
 
 bool isHyosSpawner() {

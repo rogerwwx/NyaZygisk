@@ -14,14 +14,6 @@ void entry(void* addr, size_t size, const char* path) {
 
     zygiskd::Init(path);
 
-    if (zn::isArtD()) {
-        LOGI("Running inside artd, loading native Zygisk Next modules");
-        // artd has no zygote JNI runtime. Do not install specialization/seccomp hooks
-        // or report a zygote heartbeat/restart for this auxiliary process.
-        zn::loadAllModules(5);
-        return;
-    }
-
     if (zn::isHyosSpawner()) {
         LOGI("Running inside hyos_spawner, initializing HyperOS Runtime");
         zn::initHyosRuntime();
