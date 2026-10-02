@@ -15,6 +15,7 @@ const ZygiskNextAPI* getApiForVersion(int target_api_version);
 
 // HyperOS Runtime support
 bool isHyosSpawner();
+bool isArtD();
 void initHyosRuntime();
 bool isHyosRuntime();
 
