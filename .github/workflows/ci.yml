@@ -127,7 +127,7 @@ jobs:
           path: zygiskd/build/symbols/debug/
 
       - name: Publish artifacts to Telegram
-        if: success() && github.event_name != 'pull_request'
+        if: success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
