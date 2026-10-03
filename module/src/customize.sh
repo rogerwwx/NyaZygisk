@@ -104,6 +104,14 @@ if [ "$KSU" ]; then
   fi
 fi
 
+# Preserve WebUI settings across updates: the running module keeps user
+# preferences in config.prop, which a fresh extraction would otherwise drop.
+OLD_CONFIG=""
+if [ -f /data/adb/modules/zygisksu/config.prop ]; then
+  OLD_CONFIG="$TMPDIR/config.prop.bak"
+  cp -f /data/adb/modules/zygisksu/config.prop "$OLD_CONFIG"
+fi
+
 # Stop any running old monitor/tracer to prevent it from overwriting new module.prop during update
 if [ "$BOOTMODE" ]; then
   for tracer_bin in \
@@ -130,6 +138,12 @@ extract "$ZIPFILE" 'emulated-soft-reboot.sh'   "$MODPATH"
 ui_print "- Extracting WebUI files"
 unzip -o "$ZIPFILE" "webroot/*" -x "*.sha256" -d "$MODPATH" >&2
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
+
+if [ -n "$OLD_CONFIG" ] && [ -f "$OLD_CONFIG" ]; then
+  ui_print "- Restoring WebUI settings"
+  cp -f "$OLD_CONFIG" "$MODPATH/config.prop"
+  chmod 0644 "$MODPATH/config.prop"
+fi
 
 mkdir "$MODPATH/bin"
 mkdir "$MODPATH/lib"
