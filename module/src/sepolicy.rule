@@ -19,6 +19,10 @@ allow system_server system_server process execmem
 allow zygote tmpfs file *
 allow zygote appdomain_tmpfs file *
 allow domain tmpfs file {open getattr map read execute}
+# ZN module memfds are created by zygiskd (ksu) and land as tmpfs/memfd_file
+# inodes. Native aux targets like artd receive them via SCM_RIGHTS; without
+# this the kernel drops the descriptor (dontaudit'd, no AVC anywhere).
+allow domain tmpfs memfd_file {getattr read write map execute}
 allow zygote magisk memfd_file {getattr read write map execute}
 allow zygote su memfd_file {getattr read write map execute}
 allow domain magisk memfd_file {getattr read write map execute}
