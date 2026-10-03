@@ -3,6 +3,15 @@ typeattribute zygisk_file mlstrustedobject
 allow domain zygisk_file dir {search getattr}
 allow domain zygisk_file sock_file {read write getattr open}
 
+# The daemon control socket is created with sockcreate=u:r:zygote:s0.
+# Native artd modules need this peer-socket permission in addition to the path permissions.
+allow artd zygote unix_stream_socket connectto
+# The module memfd sent to artd carries the zygote file label (the daemon runs
+# with sockcreate=u:r:zygote:s0), so the SCM_RIGHTS receive performs an fd use
+# check against zygote. When denied the kernel silently drops the descriptor
+# and GetZnPlan returns 0 modules. hyos_spawner (zygote domain) is unaffected.
+allow artd zygote fd use
+
 allow zygote magisk lnk_file read
 allow zygote unlabeled file {read open}
 allow zygote zygote capability sys_chroot
@@ -15,6 +24,10 @@ allow system_server system_server process execmem
 allow zygote tmpfs file *
 allow zygote appdomain_tmpfs file *
 allow domain tmpfs file {open getattr map read execute}
+# ZN module memfds are created by zygiskd (ksu) and land as tmpfs/memfd_file
+# inodes. Native aux targets like artd receive them via SCM_RIGHTS. Without
+# this rule the kernel drops the descriptor silently and no AVC is logged.
+allow domain tmpfs memfd_file {getattr read write map execute}
 allow zygote magisk memfd_file {getattr read write map execute}
 allow zygote su memfd_file {getattr read write map execute}
 allow domain magisk memfd_file {getattr read write map execute}
