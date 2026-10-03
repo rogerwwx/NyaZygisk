@@ -9,7 +9,7 @@ run-name: >-
 on:
   workflow_dispatch:
   push:
-    branches: [ master ]
+    branches: [ master, codex/a17-debug ]
     tags: [ v* ]
   pull_request:
   merge_group:
