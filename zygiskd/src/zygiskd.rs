@@ -10,6 +10,7 @@
 //!   and managing companion processes.
 
 use crate::constants::{self, DaemonSocketAction, ProcessFlags, ZKSU_VERSION};
+use crate::exclude;
 use crate::mount::{MountNamespace, MountNamespaceManager};
 use crate::utils::{self, UnixStreamExt};
 use crate::{lp_select, root_impl};
@@ -93,6 +94,7 @@ pub fn main(tmp_path: Option<&str>) -> Result<()> {
         zn_companions: Mutex::new(HashMap::new()),
     });
     let listener = create_daemon_socket()?;
+    spawn_config_watcher();
 
     info!("Daemon listening on {}", DAEMON_SOCKET_PATH.get().unwrap());
 
@@ -119,12 +121,20 @@ fn handle_connection(mut stream: UnixStream, context: Arc<AppContext>) -> Result
         // These actions are lightweight and handled synchronously.
         DaemonSocketAction::CacheMountNamespace => {
             let pid = stream.read_u32()? as i32;
-            context
-                .mount_manager
-                .save_mount_namespace(pid, MountNamespace::Clean)?;
-            context
-                .mount_manager
-                .save_mount_namespace(pid, MountNamespace::Root)?;
+            // Only the zygote/root context legitimately calls this, for its own pid,
+            // before dropping privileges to the forked child's app uid. Reject anyone
+            // else so an already-specialized process can't poison another pid's cached
+            // mount namespace entry.
+            if utils::peer_uid(&stream) != Some(0) {
+                warn!("CacheMountNamespace: rejecting request from non-root peer for pid {}", pid);
+            } else {
+                context
+                    .mount_manager
+                    .save_mount_namespace(pid, MountNamespace::Clean)?;
+                context
+                    .mount_manager
+                    .save_mount_namespace(pid, MountNamespace::Root)?;
+            }
         }
         DaemonSocketAction::PingHeartbeat => {
             let value = constants::ZYGOTE_INJECTED;
@@ -462,6 +472,17 @@ fn spawn_companion(name: &str, lib_fd: RawFd) -> Result<Option<UnixStream>> {
 
 fn handle_get_process_flags(stream: &mut UnixStream) -> Result<()> {
     let uid = stream.read_u32()? as i32;
+
+    // Legitimate callers ask this while still running as zygote/root, before dropping
+    // privileges to `uid`. An already-specialized app connecting directly to this
+    // socket would otherwise be able to probe any other uid's root-grant/denylist
+    // state, so it gets an empty, uncached answer instead.
+    if utils::peer_uid(stream) != Some(0) {
+        warn!("GetProcessFlags: rejecting request from non-root peer for uid {}", uid);
+        stream.write_u32(0)?;
+        return Ok(());
+    }
+
     let mut flags = ProcessFlags::empty();
 
     if root_impl::uid_is_manager(uid) {
@@ -472,6 +493,12 @@ fn handle_get_process_flags(stream: &mut UnixStream) -> Result<()> {
         }
         if root_impl::uid_should_umount(uid) {
             flags |= ProcessFlags::PROCESS_ON_DENYLIST;
+        }
+        if let Some(unmount) = u32::try_from(uid).ok().and_then(exclude::lookup) {
+            flags |= ProcessFlags::PROCESS_EXCLUDED;
+            if unmount {
+                flags |= ProcessFlags::PROCESS_ON_DENYLIST;
+            }
         }
     }
 
@@ -492,6 +519,17 @@ fn handle_get_process_flags(stream: &mut UnixStream) -> Result<()> {
 
 fn handle_update_mount_namespace(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
     let namespace_type = MountNamespace::try_from(stream.read_u8()?)?;
+
+    // Only the zygote/root context, mid-specialize, legitimately needs to setns()
+    // into the cached namespaces (setns itself would fail without CAP_SYS_ADMIN for
+    // anyone else), but there's no reason to hand the fd out at all to a peer that
+    // isn't root.
+    if utils::peer_uid(stream) != Some(0) {
+        warn!("UpdateMountNamespace: rejecting request from non-root peer");
+        stream.write_u8(0)?;
+        return Ok(());
+    }
+
     if let Some(fd) = context.mount_manager.get_namespace_fd(namespace_type) {
         // Namespace is already cached, send the FD to the client.
         // SUCCESS: Send Status '1', then the FD.
@@ -874,6 +912,47 @@ fn initialize_shared_memory() -> Result<()> {
         })?;
 
     Ok(())
+}
+
+/// Drops every cached entry so the next `GetProcessFlags` of each uid reaches the daemon.
+fn invalidate_process_flag_cache() {
+    if let Some(shm) = SHARED_MEMORY.get() {
+        let _guard = shm.write_lock.lock().unwrap();
+        let layout = shm.layout();
+        let base_version = layout.version.load(Ordering::Relaxed);
+        layout
+            .version
+            .store(base_version.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+
+        for entry in layout.entries.iter() {
+            entry.uid.store(u32::MAX, Ordering::Relaxed);
+            entry.flags.store(0, Ordering::Relaxed);
+        }
+
+        layout
+            .version
+            .store(base_version.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// Flushes the flag cache whenever the WebUI rewrites `config.prop`; otherwise a cached
+/// answer would keep serving the old exclusion list until the daemon restarts.
+fn spawn_config_watcher() {
+    thread::spawn(|| {
+        let mut last = exclude::config_mtime();
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let current = exclude::config_mtime();
+            if current != last {
+                last = current;
+                // Re-read first so a miss right after the flush sees the new list.
+                exclude::refresh();
+                invalidate_process_flag_cache();
+                debug!("config.prop changed, process flag cache flushed");
+            }
+        }
+    });
 }
 
 fn cache_process_flags(uid: u32, flags: u32) {
