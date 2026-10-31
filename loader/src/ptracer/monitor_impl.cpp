@@ -15,6 +15,7 @@
 #include "logging.hpp"
 #include "monitor.hpp"
 #include "utils.hpp"
+#include "zn_targets.hpp"
 
 // --- AppMonitor Method Implementations ---
 
@@ -737,21 +738,26 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
 #if defined(__LP64__)
         bool is_hyos_spawner = (clean_prog == "/system_ext/bin/hyos_spawner" ||
                                 clean_prog.ends_with("/hyos_spawner"));
+        // The ART daemon is started by init, not by zygote, so the monitor is what has to
+        // hand it to the injector. Zygisk Next modules address it as "artd".
+        bool is_artd = zn::isArtDPath(clean_prog);
 #else
         bool is_hyos_spawner = false;
+        bool is_artd = false;
 #endif
 
-        if (!is_zygote && !is_hyos_spawner) {
+        if (!is_zygote && !is_hyos_spawner && !is_artd) {
             break;  // Irrelevant program, exit block and return false.
         }
 
         const char *tracer;
-        if (is_hyos_spawner) {
-            // Not check_and_prepare_injection(): that would count hyos_spawner execs
+        if (is_hyos_spawner || is_artd) {
+            // Not check_and_prepare_injection(): that would count auxiliary target execs
             // in the Zygote crash-loop counter and reset zygote_injected.
             tracer = monitor_.get_abi_manager().prepare_aux_injection();
             if (!tracer) {
-                LOGE("daemon unavailable, skipping hyos_spawner %d", pid);
+                LOGE("daemon unavailable, skipping auxiliary target %s (%d)",
+                     clean_prog.c_str(), pid);
                 break;
             }
         } else {
@@ -764,7 +770,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
 
         // --- Target Handover Sequence ---
         LOGI("intercepted %s %d, halting for injector hand-off",
-             is_hyos_spawner ? "hyos_spawner" : "zygote", pid);
+             is_artd ? "artd" : is_hyos_spawner ? "hyos_spawner" : "zygote", pid);
 
         // Force the process into a standard SIGSTOP state.
         kill(pid, SIGSTOP);
@@ -782,7 +788,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             // Fork and execute the external injector daemon.
             auto p = fork_dont_care();
             if (p == 0) {
-                if (is_hyos_spawner) {
+                if (is_hyos_spawner || is_artd) {
                     execl(tracer, basename(tracer), "trace", std::to_string(pid).c_str(),
                           nullptr);
                 } else {
