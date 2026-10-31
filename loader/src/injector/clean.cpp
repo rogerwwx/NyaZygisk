@@ -24,18 +24,18 @@
 #endif
 
 #include "atexit.hpp"
+#include "cfi.hpp"
 #include "fossil.hpp"
 #include "logging.hpp"
 #include "solist.hpp"
 #include "zygisk.hpp"
 
-constexpr const char *kConfigPath = "/data/adb/modules/zygisksu/config.prop";
+constexpr const char *kConfigPath = "/data/adb/nyazygisk/config.prop";
 
 void clean_libc_trace() {
-    auto g_array = Atexit::findAtexitArray();
-    if (g_array != nullptr) {
-        g_array->recompact();
-        LOGV("g_array after recompact: %s", g_array->format_state_string().c_str());
+    const auto status = Atexit::scrubFingerprint();
+    if (status != Atexit::ScrubStatus::kDone && status != Atexit::ScrubStatus::kNothingToScrub) {
+        LOGW("atexit fingerprint left in place: %s", Atexit::describe(status));
     }
 }
 
@@ -51,26 +51,37 @@ void clean_linker_trace(const char *path, size_t loaded_modules, size_t unloaded
     }
 }
 
-bool is_anonymous_memory_enabled() {
+// True if config.prop contains a line matching exactly "key=value".
+static bool config_line_present(const char *key, const char *value) {
     FILE *fp = fopen(kConfigPath, "r");
     if (fp == nullptr) return false;
 
+    char needle[64];
+    snprintf(needle, sizeof(needle), "%s=%s", key, value);
+
     char line[128];
-    bool enabled = false;
+    bool found = false;
     while (fgets(line, sizeof(line), fp) != nullptr) {
         char *end = line + strlen(line);
         while (end > line && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' ||
                               end[-1] == '\t')) {
             *--end = '\0';
         }
-        if (strcmp(line, "anonymous_memory=1") == 0) {
-            enabled = true;
+        if (strcmp(line, needle) == 0) {
+            found = true;
             break;
         }
     }
     fclose(fp);
-    return enabled;
+    return found;
 }
+
+bool is_anonymous_memory_enabled() { return config_line_present("anonymous_memory", "1"); }
+
+// Opt-in, like anonymous_memory: the custom module loader (loader/src/linker/) is
+// experimental, so a missing config.prop (fresh install) or a config without the key
+// keeps the plain android_dlopen_ext path until the WebUI explicitly turns it on.
+bool is_custom_linker_enabled() { return config_line_present("custom_linker", "1"); }
 
 static size_t page_size() {
     long sz = sysconf(_SC_PAGESIZE);
@@ -107,21 +118,24 @@ static bool find_cfi_shadow(CfiShadowRange *out) {
     FILE *fp = fopen("/proc/self/maps", "re");
     if (fp == nullptr) return false;
     char line[512];
+    CfiShadowRange run, best;
     while (fgets(line, sizeof(line), fp) != nullptr) {
         if (strstr(line, "[anon:cfi shadow]") == nullptr) continue;
         unsigned long start = 0, end = 0;
-        char perms[5] = {};
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
-        out->start = start;
-        out->end = end;
-        out->prot = (perms[0] == 'r' ? PROT_READ : 0) |
-                    (perms[1] == 'w' ? PROT_WRITE : 0) |
-                    (perms[2] == 'x' ? PROT_EXEC : 0);
-        fclose(fp);
-        return true;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        if (run.end != 0 && run.end == start) {
+            run.end = end;
+        } else {
+            run.start = start;
+            run.end = end;
+        }
+        if (run.end - run.start > best.end - best.start) best = run;
     }
     fclose(fp);
-    return false;
+    if (best.end == 0) return false;
+    *out = best;
+    out->prot = PROT_READ;
+    return true;
 }
 
 static bool sync_cfi_shadow(uintptr_t old_start, uintptr_t new_start, size_t size) {
@@ -221,24 +235,71 @@ bool restore_cfi_shadow(const SavedCfiShadow &saved) {
     return true;
 }
 
+void register_cfi_unchecked(uintptr_t base, size_t size) {
+    if (base == 0 || size == 0) return;
+
+    CfiShadowRange shadow;
+    if (!find_cfi_shadow(&shadow)) return;  // device/process without cross-DSO CFI
+
+    uintptr_t end = base + size - 1;
+    uintptr_t dst = shadow.start + cfi_shadow_offset(base);
+    uintptr_t dst_end = shadow.start + cfi_shadow_offset(end) + kCfiShadowEntrySize;
+    if (dst < shadow.start || dst_end > shadow.end || dst_end <= dst) {
+        LOGE("cfi-shadow: module range outside shadow map");
+        return;
+    }
+
+    size_t pg = page_size();
+    uintptr_t prot_start = page_down(dst, pg);
+    uintptr_t prot_end = page_up(dst_end, pg);
+    bool reprotect = (shadow.prot & PROT_WRITE) == 0;
+    if (reprotect && mprotect(reinterpret_cast<void *>(prot_start), prot_end - prot_start,
+                              shadow.prot | PROT_WRITE) != 0) {
+        LOGE("cfi-shadow: make writable failed");
+        return;
+    }
+
+    int changed = linker::CfiMarkUncheckedRange(shadow.start, shadow.end, base, size);
+
+    if (reprotect)
+        mprotect(reinterpret_cast<void *>(prot_start), prot_end - prot_start, shadow.prot);
+
+    LOGV("cfi-shadow: marked %d granule(s) unchecked for [%p, %p]", changed,
+         reinterpret_cast<void *>(base), reinterpret_cast<void *>(base + size));
+}
+
 struct MapRange {
     uintptr_t start = 0;
     uintptr_t end = 0;
     int prot = 0;
 };
 
-static int anonymize_ranges(const MapRange *ranges, int nr) {
+static int anonymize_ranges(const MapRange *ranges, int nr, bool clear_write_permission = false) {
     int done = 0;
     for (int i = 0; i < nr; ++i) {
         size_t size = ranges[i].end - ranges[i].start;
         if (size == 0) continue;
         void *addr = reinterpret_cast<void *>(ranges[i].start);
 
-        // Preflight every permission the replacement will need. In particular,
-        // executable mappings fail here on an execmem denial, before the original
-        // file-backed VMA is displaced.
-        int copy_prot = ranges[i].prot | PROT_READ | PROT_WRITE;
-        void *copy = mmap(nullptr, size, copy_prot, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        // Final protection the target address should have once this call returns —
+        // ranges[i].prot, minus the write bit when this range is RWX and the caller
+        // asked to drop it (see below). Computed once so it can be applied to the
+        // scratch copy BEFORE the mremap swap: the target then goes straight from its
+        // old protection to this exact final one, with no intermediate state. An
+        // earlier version of this function instead mmap'd the copy with every bit the
+        // target would ever need (so an executable range's copy was RWX from the
+        // start) and only narrowed it down with a *second* mprotect AFTER the mremap —
+        // which left every executable range briefly simultaneously writable and
+        // executable (W+X) for the few instructions between the swap and that
+        // follow-up call. v2.4 never had this window; match it.
+        const bool was_rwx = (ranges[i].prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) ==
+                            (PROT_READ | PROT_WRITE | PROT_EXEC);
+        const int final_prot = (clear_write_permission && was_rwx)
+                                   ? (ranges[i].prot & ~PROT_WRITE)
+                                   : ranges[i].prot;
+
+        // The scratch copy only needs RW to receive the memcpy below.
+        void *copy = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (copy == MAP_FAILED) {
             LOGV("maps-spoof: mmap preflight failed for [%p, %p]", addr,
                  reinterpret_cast<void *>(ranges[i].end));
@@ -262,17 +323,34 @@ static int anonymize_ranges(const MapRange *ranges, int nr) {
             continue;
         }
 
+        // Apply the target's final permissions to the copy now, while it is still at
+        // its own, harmless address — an execmem denial on an executable range
+        // surfaces here, before the original mapping at `addr` is touched at all, same
+        // safety property as the old preflight-on-mmap approach but without ever
+        // creating an RWX mapping to get there. This also folds in the optional
+        // write-bit drop: scoped to exactly the range this call already matched and is
+        // about to anonymize anyway — never a fresh scan of /proc/self/maps for "any
+        // RWX entry", which would also catch other subsystems' legitimate RWX mappings
+        // (e.g. ART's JIT cache, a GPU shader compiler cache) that happen to exist in
+        // this process and have nothing to do with our module. Downgrading one of
+        // those breaks its owner the next time it writes to memory it still believes
+        // is writable.
+        if (mprotect(copy, size, final_prot) != 0) {
+            PLOGE("maps-spoof: set replacement permissions failed [%p, %p]", addr,
+                  reinterpret_cast<void *>(ranges[i].end));
+            munmap(copy, size);
+            continue;
+        }
+
         if (mremap(copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, addr) == MAP_FAILED) {
             PLOGE("maps-spoof: mremap failed [%p, %p]", addr,
                   reinterpret_cast<void *>(ranges[i].end));
             munmap(copy, size);
             continue;
         }
-
-        if (mprotect(addr, size, ranges[i].prot) != 0) {
-            PLOGE("maps-spoof: restore target protection failed [%p, %p]", addr,
-                  reinterpret_cast<void *>(ranges[i].end));
-            continue;
+        if (final_prot != ranges[i].prot) {
+            LOGV("maps-spoof: cleared write permission for [%p, %p]", addr,
+                 reinterpret_cast<void *>(ranges[i].end));
         }
 
         // Clear VMA anon name to make it pure anonymous (path in /proc/self/maps becomes empty).
@@ -431,7 +509,7 @@ int spoof_fd_maps(int fd, bool private_only) {
     return done;
 }
 
-int spoof_virtual_maps(const char *path_substr, bool private_only) {
+int spoof_virtual_maps(const char *path_substr, bool private_only, bool clear_write_permission) {
     if (path_substr == nullptr || path_substr[0] == '\0') return 0;
     MapRange ranges[64];
     int nr = 0;
@@ -452,40 +530,22 @@ int spoof_virtual_maps(const char *path_substr, bool private_only) {
     }
     fclose(fp);
 
-    int done = anonymize_ranges(ranges, nr);
+    int done = anonymize_ranges(ranges, nr, clear_write_permission);
     LOGV("maps-spoof: anonymized %d/%d segment(s) matching '%s'", done, nr, path_substr);
     return done;
 }
 
 
 void spoof_module_maps(bool clear_write_permission) {
+    // clear_write_permission is forwarded straight into the same anonymize pass that already
+    // matched these paths, so the write bit is only ever dropped from a range we just verified
+    // is actually one of our module's own (memfd-derived) mappings — never from a fresh,
+    // unscoped /proc/self/maps rescan for "any RWX entry", which would also catch other
+    // subsystems' legitimate RWX mappings that happen to exist in this process (ART's JIT
+    // cache, a GPU shader compiler cache, ...) and have nothing to do with our module.
     constexpr std::array paths{"jit-cache-zygisk", "zygisk-module", "zn-module"};
     for (const char *path : paths) {
-        spoof_virtual_maps(path, /*private_only=*/true);
-    }
-
-    if (clear_write_permission) {
-        FILE *fp = fopen("/proc/self/maps", "re");
-        if (fp != nullptr) {
-            char line[512];
-            while (fgets(line, sizeof(line), fp) != nullptr) {
-                unsigned long start = 0, end = 0;
-                char perms[5] = {};
-                int path_off = 0;
-                if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %n", &start, &end, perms, &path_off) < 3)
-                    continue;
-                if (perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
-                    void *addr = reinterpret_cast<void *>(start);
-                    size_t size = end - start;
-                    int new_perms = PROT_READ | PROT_EXEC;
-                    if (mprotect(addr, size, new_perms) == 0) {
-                        LOGV("cleared write permission for rwx entry [%p, %p]", addr,
-                             reinterpret_cast<void *>(end));
-                    }
-                }
-            }
-            fclose(fp);
-        }
+        spoof_virtual_maps(path, /*private_only=*/true, clear_write_permission);
     }
 }
 
