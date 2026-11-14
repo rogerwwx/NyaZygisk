@@ -30,7 +30,7 @@
 #include "solist.hpp"
 #include "zygisk.hpp"
 
-constexpr const char *kConfigPath = "/data/adb/nyazygisk/config.prop";
+constexpr const char *kConfigPath = "/data/system/nyazygisk/config.prop";
 
 void clean_libc_trace() {
     const auto status = Atexit::scrubFingerprint();
@@ -53,7 +53,7 @@ void clean_linker_trace(const char *path, size_t loaded_modules, size_t unloaded
 
 // True if config.prop contains a line matching exactly "key=value".
 static bool config_line_present(const char *key, const char *value) {
-    FILE *fp = fopen(kConfigPath, "r");
+    FILE *fp = fopen(kConfigPath, "re");
     if (fp == nullptr) return false;
 
     char needle[64];
@@ -82,6 +82,9 @@ bool is_anonymous_memory_enabled() { return config_line_present("anonymous_memor
 // experimental, so a missing config.prop (fresh install) or a config without the key
 // keeps the plain android_dlopen_ext path until the WebUI explicitly turns it on.
 bool is_custom_linker_enabled() { return config_line_present("custom_linker", "1"); }
+
+// PLT hook engine for ZN modules: bytehook (default) or lsplt.
+bool is_lsplt_engine_configured() { return config_line_present("plt_engine", "lsplt"); }
 
 static size_t page_size() {
     long sz = sysconf(_SC_PAGESIZE);

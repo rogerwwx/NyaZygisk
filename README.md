@@ -1,4 +1,4 @@
-# NyaZygisk
+﻿# NyaZygisk
 
 NyaZygisk is an open-source Zygote injection framework implemented via [`ptrace`](https://man7.org/linux/man-pages/man2/ptrace.2.html) for APatch, KernelSU, and Magisk.
 It loads both **Magisk Zygisk API** modules and **Zygisk Next (ZN) API** modules from a single implementation, and can replace Magisk's built-in Zygisk.
@@ -58,7 +58,7 @@ A detailed comparison (in Traditional Chinese) is available at [nkbe.top](https:
 * Active modules labelled by type (`[Zygisk]` / `[Next]`) with their target process bindings.
 * Per-app module exclusion list for user apps.
 * Device information, including the vendor ROM version.
-* Settings, stored in `/data/adb/nyazygisk/config.prop`, that apply to app processes started afterwards (see [Experimental options](#experimental-options)).
+* Settings, stored in `/data/system/nyazygisk/config.prop`, that apply to app processes started afterwards (see [Experimental options](#experimental-options)).
 
 ### Experimental options
 
@@ -81,7 +81,7 @@ Install only one Zygisk implementation at a time. NyaZygisk replaces NeoZygisk, 
 
 ## Installation
 
-1. Download the latest release from [GitHub Releases](https://github.com/HSSkyBoy/NyaZygisk/releases).
+1. Download the latest release from [GitHub Releases](https://github.com/Nk-Be/NyaZygisk/releases).
 2. Install the zip from your root manager (APatch, KernelSU, or Magisk).
 3. Reboot.
 4. Check the module description or open the WebUI to confirm the daemons are running.

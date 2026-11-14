@@ -15,6 +15,7 @@ void entry(void* addr, size_t size, const char* path, TraceMode mode) {
     LOGI("zygisk library injected, version %s [mode: %d]", ZKSU_VERSION, mode);
 
     zygiskd::Init(path);
+    zn::initHookEngine();
 
     if (zn::isArtD()) {
         LOGI("Running inside artd, loading native Zygisk Next modules");

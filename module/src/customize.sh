@@ -133,10 +133,31 @@ ui_print "- Extracting WebUI files"
 unzip -o "$ZIPFILE" "webroot/*" -x "*.sha256" -d "$MODPATH" >&2
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
-if [ -f "/data/adb/modules/zygisksu/config.prop" ] && [ ! -f "/data/adb/nyazygisk/config.prop" ]; then
-  ui_print "- Migrating existing WebUI config to /data/adb/nyazygisk"
-  mkdir -p "/data/adb/nyazygisk"
-  cp -af "/data/adb/modules/zygisksu/config.prop" "/data/adb/nyazygisk/config.prop"
+# Migrate WebUI config to /data/system/nyazygisk
+mkdir -p "/data/system/nyazygisk"
+chmod 755 "/data/system/nyazygisk"
+chcon u:object_r:system_file:s0 "/data/system/nyazygisk"
+chown system:system "/data/system/nyazygisk"
+
+if [ ! -f "/data/system/nyazygisk/config.prop" ]; then
+  if [ -f "/data/adb/nyazygisk/config.prop" ]; then
+    ui_print "- Migrating WebUI config from /data/adb/nyazygisk"
+    cp -af "/data/adb/nyazygisk/config.prop" "/data/system/nyazygisk/config.prop"
+  elif [ -f "/data/adb/modules/zygisksu/config.prop" ]; then
+    ui_print "- Migrating WebUI config from /data/adb/modules/zygisksu"
+    cp -af "/data/adb/modules/zygisksu/config.prop" "/data/system/nyazygisk/config.prop"
+  fi
+fi
+
+if [ -f "/data/system/nyazygisk/config.prop" ]; then
+  chmod 644 "/data/system/nyazygisk/config.prop"
+  chcon u:object_r:system_file:s0 "/data/system/nyazygisk/config.prop"
+  chown system:system "/data/system/nyazygisk/config.prop"
+fi
+
+# Clean up legacy /data/adb/nyazygisk directory if present
+if [ -d "/data/adb/nyazygisk" ]; then
+  rm -rf "/data/adb/nyazygisk"
 fi
 
 mkdir "$MODPATH/bin"
@@ -187,8 +208,8 @@ if [ "$HUAWEI_MAPLE_ENABLED" == "1" ]; then
 fi
 
 # NeoZygisk is binaries and scripts only, so none of what it installs waits for a boot
-# stage: hotinstall.sh replaces the running monitor and restarts zygote, which is all an
-# update needs. The Maple workaround above is the one exception. KernelSU loads a
+# stage: hotinstall.sh replaces the running monitor, which is all an update needs.
+# The Maple workaround above is the one exception. KernelSU loads a
 # system.prop from post-fs-data and from late load, but its hot-install path deliberately
 # loads none, so a build that wrote one has to take the reboot.
 if [ "$KSU" ] && [ ! -f "$MODPATH/system.prop" ]; then
