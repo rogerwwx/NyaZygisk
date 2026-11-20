@@ -59,4 +59,8 @@ bool Dlclose(void *handle) {
 
 bool IsCustom(void *handle) { return linker::IsOurHandle(handle); }
 
+bool HasLoadedImages() { return linker::HasLoadedImages(); }
+
+void WithImagesLocked(void (*fn)(void *), void *arg) { linker::WithImagesLocked(fn, arg); }
+
 }  // namespace modloader

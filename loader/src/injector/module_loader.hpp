@@ -24,4 +24,12 @@ bool Dlclose(void *handle);
 // solist). Used by the trace-cleanup accounting.
 bool IsCustom(void *handle);
 
+// Whether any module loaded by the custom linker is still resident in this
+// process. While true, libzygisk.so must stay mapped because the module's GOT
+// binds dl_iterate_phdr / dladdr / dlsym / dlclose to our interpose table.
+bool HasLoadedImages();
+
+// Run fn(arg) with the custom linker's image registry locked.
+void WithImagesLocked(void (*fn)(void *), void *arg);
+
 }  // namespace modloader
