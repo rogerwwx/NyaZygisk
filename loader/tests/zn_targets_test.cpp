@@ -5,6 +5,7 @@ int main() {
     assert(zn::isArtDPath("/apex/com.android.art/bin/artd"));
     assert(zn::isArtDPath("/apex/com.android.art@371000000/bin/artd"));
     assert(zn::isArtDPath("/apex/com.android.art/bin/artd (deleted)"));
+    assert(zn::isArtDPath("/apex/com.android.art@371000000/bin/artd (deleted)"));
     assert(!zn::isArtDPath("/apex/com.android.art/bin/art_exec"));
     assert(!zn::isArtDPath("/apex/com.android.art/bin/dex2oat64"));
     assert(!zn::isArtDPath("/data/local/tmp/artd"));

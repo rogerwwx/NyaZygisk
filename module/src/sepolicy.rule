@@ -31,6 +31,10 @@ allow zygote appdomain_tmpfs file *
 allow artd tmpfs file {open getattr map read write execute}
 allow artd magisk memfd_file {getattr read write map execute}
 allow artd su memfd_file {getattr read write map execute}
+# Chained ZN hooks fall back to a memfd-backed RX stub when anonymous execmem is denied.
+# These memfds are created inside artd, rather than received from the root daemon.
+allow artd artd_tmpfs file {getattr read write map execute}
+allow artd artd memfd_file {getattr read write map execute}
 allow zygote magisk memfd_file {getattr read write map execute}
 allow zygote su memfd_file {getattr read write map execute}
 allow zygote proc file *

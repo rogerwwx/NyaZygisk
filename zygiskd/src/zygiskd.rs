@@ -13,6 +13,7 @@ use crate::constants::{self, DaemonSocketAction, ProcessFlags, ZKSU_VERSION};
 use crate::exclude;
 use crate::mount::{MountNamespace, MountNamespaceManager};
 use crate::utils::{self, UnixStreamExt};
+use crate::zn_peer::{self, AID_SYSTEM};
 use crate::{lp_select, root_impl};
 use anyhow::{Context as AnyhowContext, Result, bail};
 use log::{debug, error, info, trace, warn};
@@ -36,7 +37,6 @@ use std::{
     time::Duration,
 };
 
-const AID_SYSTEM: u32 = 1000;
 const WORKER_POOL_SIZE: usize = 16;
 const WORKER_QUEUE_CAPACITY: usize = 128;
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -353,7 +353,7 @@ fn handle_connection(mut stream: UnixStream, context: &Arc<AppContext>) -> Resul
             handle_get_shared_memory_fd(&mut stream)?;
         }
         DaemonSocketAction::GetZnPlan => {
-            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+            if !zn_peer::can_access_modules(peer) {
                 warn!("GetZnPlan: rejecting request from untrusted peer {:?}", peer);
                 stream.write_usize(0)?;
                 return Ok(());
@@ -361,7 +361,7 @@ fn handle_connection(mut stream: UnixStream, context: &Arc<AppContext>) -> Resul
             handle_get_zn_plan(&mut stream, context)?;
         }
         DaemonSocketAction::ReportZnModule => {
-            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+            if !zn_peer::can_access_modules(peer) {
                 warn!("ReportZnModule: rejecting request from untrusted peer {:?}", peer);
                 stream.write_u8(0)?;
                 return Ok(());

@@ -95,7 +95,7 @@ Telegram: [@NyaZygisk](t.me/NYAZYGISK)
 
 ## Known Limitations
 
-* **ZN module injection targets:** Zygisk Next and ZNNext can inject ZN modules into any init-spawned process declared with `path=` / `name=` in `zn_modules.txt`. NyaZygisk currently intercepts only Zygote and `hyos_spawner`, so ZN modules targeting other system daemons will not be loaded.
+* **ZN module injection targets:** Zygisk Next and ZNNext can inject ZN modules into any init-spawned process declared with `path=` / `name=` in `zn_modules.txt`. This fork intercepts Zygote, `hyos_spawner`, and the 64-bit ART daemon (`artd`, including versioned ART APEX paths). ZN modules targeting other system daemons will not be loaded.
 
 ## The DenyList Explained
 

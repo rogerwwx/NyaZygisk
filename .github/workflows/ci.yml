@@ -70,6 +70,13 @@ jobs:
         with:
           tool: cargo-ndk
 
+      - name: Check native ZN target regressions
+        run: |
+          rustc --edition=2024 --test zygiskd/src/zn_peer.rs -o "$RUNNER_TEMP/zn-peer-tests"
+          "$RUNNER_TEMP/zn-peer-tests"
+          c++ -std=c++20 -Wall -Wextra -Werror -Iloader/src/include loader/tests/zn_targets_test.cpp -o "$RUNNER_TEMP/zn-targets-test"
+          "$RUNNER_TEMP/zn-targets-test"
+
       - name: Setup Ccache for faster builds
         uses: hendrikmuhs/ccache-action@v1
         with:
