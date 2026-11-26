@@ -30,7 +30,7 @@ A detailed comparison (in Traditional Chinese) is available at [nkbe.top](https:
 
 * **Magisk Zygisk API v5:** full compatibility with modules built for [Magisk's built-in Zygisk](https://github.com/topjohnwu/Magisk/tree/master/native/src/core/zygisk).
 * **Zygisk Next API v4:** loads modules declared in `zn_modules.txt`, providing:
-  * `inlineHook` via [Dobby](https://github.com/LSPosed/Dobby) and `pltHook` via [LSPlt](https://github.com/LSPosed/LSPlt);
+  * `inlineHook` via [Dobby](https://github.com/LSPosed/Dobby) and `pltHook` via [YukiPLT](https://github.com/Rouyashiki/YukiPLT) (default), [ByteHook](https://github.com/bytedance/bhook), or [LSPlt](https://github.com/LSPosed/LSPlt);
   * ELF symbol resolution, including `.gnu_debugdata` LZMA decompression for stripped system libraries;
   * companion processes hosted by the root daemon (`zygiskd`).
 * **HyperOS Runtime API v1:** application callbacks for modules targeting Xiaomi's `hyos_spawner`.
@@ -58,7 +58,7 @@ A detailed comparison (in Traditional Chinese) is available at [nkbe.top](https:
 * Active modules labelled by type (`[Zygisk]` / `[Next]`) with their target process bindings.
 * Per-app module exclusion list for user apps.
 * Device information, including the vendor ROM version.
-* Settings, stored in `/data/system/nyazygisk/config.prop`, that apply to app processes started afterwards (see [Experimental options](#experimental-options)).
+* Settings, stored in `/data/system_de/nyazygisk/config.prop`, that apply to app processes started afterwards (see [Experimental options](#experimental-options)).
 
 ### Experimental options
 
@@ -66,6 +66,8 @@ Both options are off by default and can be switched in the WebUI.
 
 * **Anonymous memory** (`anonymous_memory=1`): after specialization, turns the module mappings in `/proc/self/maps` into anonymous mappings. Some users have reported problems with it enabled, such as the system UI failing to start or `Monitor: NO`; if you see that, turn it off first.
 * **Custom linker** (`custom_linker=1`): loads modules with NyaZygisk's built-in ELF loader instead of the system linker, so they never enter its solist. If a module cannot be loaded this way, it falls back to the system linker.
+
+When the current work directory has no config, installation and startup import only the `anonymous_memory=0/1` preference from `/data/system/nyazygisk`, `/data/adb/nyazygisk`, or the old module directory, in that order. Old hook engine settings are left behind so the current default applies. User-edited `spoof.prop` is preserved separately. Existing files in `/data/system_de/nyazygisk` take precedence.
 
 ## Requirements
 
@@ -95,7 +97,7 @@ Telegram: [@NyaZygisk](t.me/NYAZYGISK)
 
 ## Known Limitations
 
-* **ZN module injection targets:** Zygisk Next and ZNNext can inject ZN modules into any init-spawned process declared with `path=` / `name=` in `zn_modules.txt`. NyaZygisk currently intercepts only Zygote and `hyos_spawner`, so ZN modules targeting other system daemons will not be loaded.
+* **ZN module injection targets:** Zygisk Next and ZNNext can inject ZN modules into any init-spawned process declared with `path=` / `name=` in `zn_modules.txt`. This fork intercepts Zygote, `hyos_spawner`, and the 64-bit ART daemon (`artd`, including versioned ART APEX paths). ZN modules targeting other system daemons will not be loaded.
 
 ## The DenyList Explained
 
@@ -124,13 +126,13 @@ NyaZygisk uses two strategies to provide a clean mount namespace:
 
 ## Property Spoofing
 
-At boot, if `/data/system/nyazygisk/spoof.prop` exists, NyaZygisk applies its entries via `resetprop -n` (bootloader and verified-boot properties early during `zygisk-init.sh`, and debug/build properties later during `service.sh` so early-boot ADB debugging is preserved). User edits to `/data/system/nyazygisk/spoof.prop` are preserved across module updates. The default file covers:
+At boot, if `/data/system_de/nyazygisk/spoof.prop` exists, NyaZygisk applies its entries via `resetprop -n` (bootloader and verified-boot properties early during `zygisk-init.sh`, and debug/build properties later during `service.sh` so early-boot ADB debugging is preserved). User edits to `/data/system_de/nyazygisk/spoof.prop` are preserved across module updates. The default file covers:
 
 * bootloader and verified boot state (`ro.boot.verifiedbootstate`, `ro.boot.vbmeta.device_state`, `ro.boot.flash.locked`, ...);
 * build type and debuggable flags;
 * vendor-specific properties for MIUI, Realme, and OPlus.
 
-If not explicitly specified in `spoof.prop`, `ro.boot.vbmeta.digest` is generated randomly at boot. Edit `/data/system/nyazygisk/spoof.prop` to add, change, or remove entries (or remove the file to disable property spoofing); lines starting with `#` are ignored.
+If not explicitly specified in `spoof.prop`, `ro.boot.vbmeta.digest` is preserved when already a valid non-zero 64-hex digest, and generated randomly otherwise. Edit `/data/system_de/nyazygisk/spoof.prop` to add, change, or remove entries (or remove the file to disable property spoofing); lines starting with `#` are ignored.
 
 ## Building
 
@@ -150,6 +152,7 @@ The module zips are written to `module/build/outputs/release/`.
 * [ZNNext](https://github.com/VeryBaaad/ZNNext): reference implementation of the standalone Zygisk Next API
 * [Dobby](https://github.com/LSPosed/Dobby): inline hooking engine
 * [rv64hook](https://github.com/eirv/riscv64-inline-hook): inline hooking engine for RISC-v 64
+* [YukiPLT](https://github.com/Rouyashiki/YukiPLT): default in-place PLT/GOT hooking library for ZN modules
 * [LSPlt](https://github.com/LSPosed/LSPlt): PLT hooking library for Android
 * [xz-embedded](https://github.com/tukaani-project/xz-embedded): `.gnu_debugdata` decompression
 

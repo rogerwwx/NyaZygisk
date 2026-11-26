@@ -81,6 +81,7 @@ mod mount;
 mod root_impl;
 mod utils;
 mod zn_companion;
+mod zn_peer;
 mod zygiskd;
 
 use crate::constants::ZKSU_VERSION;

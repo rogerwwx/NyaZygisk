@@ -1,6 +1,6 @@
 // Exercises the real is_custom_linker_enabled() / is_anonymous_memory_enabled()
 // (clean.cpp) against an actual config.prop at the hardcoded path they read
-// (kConfigPath = /data/system/nyazygisk/config.prop) — safe to create for real
+// (kConfigPath = /data/system_de/nyazygisk/config.prop) — safe to create for real
 // inside this chroot. Links clean.cpp directly, same as spoof_rwx_test.cpp.
 #include <stdio.h>
 #include <sys/stat.h>
@@ -14,8 +14,8 @@ void Check(const char* what, bool ok) {
     if (!ok) g_failures++;
 }
 
-constexpr const char* kConfigDir = "/data/system/nyazygisk";
-constexpr const char* kConfigPath = "/data/system/nyazygisk/config.prop";
+constexpr const char* kConfigDir = "/data/system_de/nyazygisk";
+constexpr const char* kConfigPath = "/data/system_de/nyazygisk/config.prop";
 
 void WriteConfig(const char* contents) {
     remove(kConfigPath);
@@ -31,7 +31,7 @@ void WriteConfig(const char* contents) {
 }  // namespace
 
 int main() {
-    mkdir("/data/system", 0755);  // mkdir doesn't create parents; the rootfs may lack this
+    mkdir("/data/system_de", 0755);  // mkdir doesn't create parents; the rootfs may lack this
     mkdir(kConfigDir, 0755);
 
     printf("== custom_linker: opt-in semantics\n");
@@ -59,9 +59,11 @@ int main() {
     WriteConfig("anonymous_memory=1\n");
     Check("anonymous_memory=1 -> enabled", is_anonymous_memory_enabled());
 
-    printf("== plt_engine: bytehook default vs lsplt opt-in\n");
+    printf("== plt_engine: yukiplt default vs bytehook/lsplt opt-in\n");
     WriteConfig(nullptr);
-    Check("missing config.prop -> lsplt is off (bytehook default)", !is_lsplt_engine_configured());
+    Check("missing config.prop -> lsplt is off (yukiplt default)", !is_lsplt_engine_configured());
+    WriteConfig("plt_engine=yukiplt\n");
+    Check("plt_engine=yukiplt -> lsplt is off", !is_lsplt_engine_configured());
     WriteConfig("plt_engine=bytehook\n");
     Check("plt_engine=bytehook -> lsplt is off", !is_lsplt_engine_configured());
     WriteConfig("plt_engine=lsplt\n");

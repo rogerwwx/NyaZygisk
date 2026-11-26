@@ -16,8 +16,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "daemon.hpp"
@@ -31,6 +33,33 @@
  */
 static bool execute_remote_injection(int pid, struct user_regs_struct &regs, const char *lib_path,
                                      TraceMode mode) {
+    struct RemoteStackCleaner {
+        int pid;
+        std::vector<std::pair<uintptr_t, size_t>> regions;
+
+        uintptr_t push(struct user_regs_struct &target_regs, const char *str) {
+            const size_t len = strlen(str) + 1;
+            const uintptr_t addr = push_string(pid, target_regs, str);
+            if (addr != 0) {
+                regions.emplace_back(addr, len);
+            }
+            return addr;
+        }
+
+        ~RemoteStackCleaner() {
+            if (regions.empty()) return;
+            size_t max_len = 0;
+            for (const auto &[addr, len] : regions) {
+                (void) addr;
+                if (len > max_len) max_len = len;
+            }
+            std::vector<uint8_t> zeros(max_len, 0);
+            for (const auto &[addr, len] : regions) {
+                write_proc(pid, addr, zeros.data(), len);
+            }
+        }
+    };
+
 #if defined(__aarch64__)
     // Clear the BTYPE field (bits 10 and 11) in PSTATE.
     // Whatever indirect branch the tracee last took may have left BTYPE at 0b11.
@@ -43,6 +72,7 @@ static bool execute_remote_injection(int pid, struct user_regs_struct &regs, con
 
     // Reserve red-zone/scratch slack below the interrupted frame before pushing arguments.
     regs.REG_SP = (regs.REG_SP - 256) & ~uintptr_t{0xf};
+    RemoteStackCleaner stack_cleaner{pid, {}};
 
     auto map = MapInfo::Scan(std::to_string(pid));
     auto local_map = MapInfo::Scan();
@@ -59,7 +89,7 @@ static bool execute_remote_injection(int pid, struct user_regs_struct &regs, con
         return false;
     }
     std::vector<long> args;
-    auto remote_lib_path = push_string(pid, regs, lib_path);
+    auto remote_lib_path = stack_cleaner.push(regs, lib_path);
     if (remote_lib_path == 0) return false;
     args.push_back((long) remote_lib_path);
     args.push_back((long) RTLD_NOW);
@@ -120,7 +150,7 @@ static bool execute_remote_injection(int pid, struct user_regs_struct &regs, con
         return false;
     }
     args.clear();
-    auto remote_entry_str = push_string(pid, regs, "entry");
+    auto remote_entry_str = stack_cleaner.push(regs, "entry");
     if (remote_entry_str == 0) return false;
     args.push_back(remote_handle);
     args.push_back((long) remote_entry_str);
@@ -173,7 +203,7 @@ static bool execute_remote_injection(int pid, struct user_regs_struct &regs, con
     args.clear();
     args.push_back((uintptr_t) start_addr);
     args.push_back(block_size);
-    auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath().c_str());
+    auto remote_tmp_path = stack_cleaner.push(regs, zygiskd::GetTmpPath().c_str());
     if (remote_tmp_path == 0) return false;
     args.push_back((long) remote_tmp_path);
     args.push_back(mode);
@@ -514,7 +544,7 @@ static bool wait_for_process(int pid, int *status) {
  * the normal path -- it only relocates the library, while the control socket stays where it
  * is, so it cannot on its own make an unreachable work directory usable.
  *
- * @param src_path The original path (e.g., /data/system/nyazygisk/lib64/libzygisk.so)
+ * @param src_path The original path (e.g., /data/system_de/nyazygisk/lib64/libzygisk.so)
  * @return The path to the temporary file, or an empty string on failure.
  */
 [[maybe_unused]] static std::string copy_to_temp(const std::string &src_path) {
@@ -651,19 +681,35 @@ static bool trace_with_seize(int pid, TraceMode mode, int *seize_errno) {
     ptrace(PTRACE_DETACH, pid, 0, 0);                                                              \
     return false;
 
-    // Wait for the initial Seize stop
-    if (!wait_for_process(pid, &status)) {
-        BAIL_AND_DETACH
-    }
-
-    // Determine the expected stop signal.
+    // Wait for the initial Seize stop, forwarding any unrelated signals that race ahead of it.
     // Spawn flow (already SIGSTOPped): SIGSTOP, with PTRACE_EVENT_STOP or plain event 0
     // if the target was already in a stopped state from the monitor hand-off.
     // Late flow (PTRACE_INTERRUPT):    SIGTRAP + PTRACE_EVENT_STOP
-    bool valid_stop = process_started
-                          ? STOPPED_WITH(SIGTRAP, PTRACE_EVENT_STOP)
-                          : (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP &&
-                             ((status >> 16) == PTRACE_EVENT_STOP || (status >> 16) == 0));
+    bool valid_stop = false;
+    for (;;) {
+        if (!wait_for_process(pid, &status)) {
+            BAIL_AND_DETACH
+        }
+        valid_stop = process_started
+                         ? STOPPED_WITH(SIGTRAP, PTRACE_EVENT_STOP)
+                         : (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP &&
+                            ((status >> 16) == PTRACE_EVENT_STOP || (status >> 16) == 0));
+        if (valid_stop) {
+            break;
+        }
+        if (WIFSTOPPED(status)) {
+            int sig = ((status >> 16) == 0) ? WSTOPSIG(status) : 0;
+            if (sig == SIGSTOP || sig == SIGTRAP) sig = 0;
+            LOGV("seize: forwarding intermediate stop %s on PID %d", parse_status(status).c_str(),
+                 pid);
+            if (ptrace(PTRACE_CONT, pid, 0, sig) == -1) {
+                PLOGE("ptrace(PTRACE_CONT) while waiting for initial stop on PID %d", pid);
+                BAIL_AND_DETACH
+            }
+            continue;
+        }
+        break;
+    }
 
     if (valid_stop) {
         arm_seccomp_events(pid, options);

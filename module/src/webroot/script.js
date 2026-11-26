@@ -1,6 +1,6 @@
-const PROP_PATH = "/data/system/nyazygisk/module.prop";
-const CONFIG_PATH = "/data/system/nyazygisk/config.prop";
-const CONFIG_DIR = "/data/system/nyazygisk";
+const PROP_PATH = "/data/system_de/nyazygisk/module.prop";
+const CONFIG_PATH = "/data/system_de/nyazygisk/config.prop";
+const CONFIG_DIR = "/data/system_de/nyazygisk";
 const PACKAGES_LIST_PATH = "/data/system/packages.list";
 const MODULE_MARKER = "@@NZMOD@@ ";
 const LANG_STORAGE_KEY = "nyazygisk.lang";
@@ -199,7 +199,7 @@ const I18N = {
 
 let currentLang = pickInitialLanguage();
 let currentTab = "overview";
-let currentPltEngine = "bytehook";
+let currentPltEngine = "yukiplt";
 let toastTimer = null;
 let refreshing = false;
 // Last successful status snapshot, kept so a language switch re-renders without a shell round trip.
@@ -481,7 +481,7 @@ function formatRootInfo(rootData, fallback) {
 function formatRomInfo(rom) {
   const oplus = rom["ro.build.version.oplusrom.display"] || rom["ro.build.version.oplusrom"];
   if (oplus) {
-    return /[a-z]{2,}/i.test(oplus) ? oplus : `ColorOS / OxygenOS ${oplus.replace(/^V/i, "")}`;
+    return /[a-z]{2,}/i.test(oplus) ? oplus : `ColorOS ${oplus.replace(/^V/i, "")}`;
   }
   const hyperos = rom["ro.mi.os.version.name"];
   if (hyperos) {
@@ -787,7 +787,9 @@ async function refresh(showSuccessToast) {
       $("anonymous-memory").checked = config.anonymous_memory === "1";
       $("custom-linker").checked = config.custom_linker === "1";
       $("exclude-unmount").checked = config.exclude_unmount !== "0";
-      currentPltEngine = config.plt_engine === "lsplt" ? "lsplt" : "bytehook";
+      currentPltEngine = ["yukiplt", "bytehook", "lsplt"].includes(config.plt_engine)
+        ? config.plt_engine
+        : "yukiplt";
       updatePltEngineButtons();
       savedExcluded = new Set(
         (config.exclude_apps || "").split(",").map((p) => p.trim()).filter(Boolean),
@@ -873,7 +875,9 @@ function setConfigValue(key, value) {
     `mkdir -p ${CONFIG_DIR} && ` +
     `{ if [ -f ${CONFIG_PATH} ]; then grep -v '^${key}=' ${CONFIG_PATH}; fi; ` +
     `printf '${key}=${value}\\n'; } > ${CONFIG_PATH}.tmp && ` +
-    `mv ${CONFIG_PATH}.tmp ${CONFIG_PATH} && chmod 0644 ${CONFIG_PATH}`,
+    `mv ${CONFIG_PATH}.tmp ${CONFIG_PATH} && chmod 0644 ${CONFIG_PATH} && ` +
+    `(chcon u:object_r:system_file:s0 ${CONFIG_PATH} 2>/dev/null || true) && ` +
+    `(chown system:system ${CONFIG_PATH} 2>/dev/null || true)`,
   );
 }
 

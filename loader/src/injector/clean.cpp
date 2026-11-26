@@ -30,7 +30,13 @@
 #include "solist.hpp"
 #include "zygisk.hpp"
 
-constexpr const char *kConfigPath = "/data/system/nyazygisk/config.prop";
+#define _NYAZYGISK_STR(x) #x
+#define NYAZYGISK_STR(x) _NYAZYGISK_STR(x)
+#ifdef WORK_DIRECTORY
+constexpr const char *kConfigPath = NYAZYGISK_STR(WORK_DIRECTORY) "/config.prop";
+#else
+constexpr const char *kConfigPath = "/data/system_de/nyazygisk/config.prop";
+#endif
 
 void clean_libc_trace() {
     const auto status = Atexit::scrubFingerprint();
@@ -83,7 +89,7 @@ bool is_anonymous_memory_enabled() { return config_line_present("anonymous_memor
 // keeps the plain android_dlopen_ext path until the WebUI explicitly turns it on.
 bool is_custom_linker_enabled() { return config_line_present("custom_linker", "1"); }
 
-// PLT hook engine for ZN modules: bytehook (default) or lsplt.
+// PLT hook engine for ZN modules: yukiplt (default), bytehook, or lsplt.
 bool is_lsplt_engine_configured() { return config_line_present("plt_engine", "lsplt"); }
 
 static size_t page_size() {
@@ -355,6 +361,14 @@ static int anonymize_ranges(const MapRange *ranges, int nr, bool clear_write_per
         // this process and have nothing to do with our module. Downgrading one of
         // those breaks its owner the next time it writes to memory it still believes
         // is writable.
+        if (ranges[i].prot & PROT_EXEC) {
+            // Flush the newly copied pages to PoU before mprotect/mremap publishes them
+            // at `addr`, eliminating any brief window where another thread could fetch
+            // stale data before the post-mremap VA invalidation completes.
+            __builtin___clear_cache(reinterpret_cast<char *>(copy),
+                                    reinterpret_cast<char *>(copy) + size);
+        }
+
         if (mprotect(copy, size, final_prot) != 0) {
             PLOGE("maps-spoof: set replacement permissions failed [%p, %p]", addr,
                   reinterpret_cast<void *>(ranges[i].end));

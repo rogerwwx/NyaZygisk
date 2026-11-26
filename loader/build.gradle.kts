@@ -40,8 +40,16 @@ val releaseFlags = arrayOf(
     "-fvisibility=hidden", "-fvisibility-inlines-hidden",
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
     "-ffunction-sections", "-fdata-sections",
-    "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", "-Wl,--icf=all", "-Wl,--strip-all", "-Wl,--pack-dyn-relocs=android"
 )
+
+val releaseLinkerFlags = listOf(
+    "-Oz", "-flto",
+    "-Wl,--exclude-libs,ALL",
+    "-Wl,--gc-sections",
+    "-Wl,--icf=safe",
+    "-Wl,--strip-all",
+    "-Wl,--pack-dyn-relocs=android",
+).joinToString(" ")
 
 android {
     buildFeatures {
@@ -70,6 +78,8 @@ android {
     buildTypes {
         debug {
             externalNativeBuild.cmake {
+                cFlags += "-DZYGISK_DEBUG"
+                cppFlags += "-DZYGISK_DEBUG"
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-debug"
             }
         }
@@ -78,6 +88,8 @@ android {
                 cFlags += releaseFlags
                 cppFlags += releaseFlags
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-release"
+                arguments += "-DCMAKE_SHARED_LINKER_FLAGS=$releaseLinkerFlags"
+                arguments += "-DCMAKE_EXE_LINKER_FLAGS=$releaseLinkerFlags"
             }
         }
     }

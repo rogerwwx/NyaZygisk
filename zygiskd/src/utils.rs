@@ -13,7 +13,7 @@ use rustix::net::{
 };
 use rustix::thread as rustix_thread;
 use std::ffi::{CString, c_char};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 use std::{
@@ -191,9 +191,10 @@ pub fn unix_listener_from_path(path: &str) -> Result<UnixListener> {
     let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
     bind(&socket, &addr)?;
     listen(&socket, 128)?;
-    // Label the socket so the zygote domain may connect on enforcing-SELinux devices.
+    // Label the socket with the AOSP built-in zygote_socket type so zygote and
+    // system_server may connect on enforcing-SELinux devices without declaring a custom type.
     match Command::new("chcon")
-        .arg("u:object_r:zygisk_file:s0")
+        .arg("u:object_r:zygote_socket:s0")
         .arg(path)
         .status()
     {
@@ -206,8 +207,9 @@ pub fn unix_listener_from_path(path: &str) -> Result<UnixListener> {
         Ok(_) => {}
     }
     // Open by DAC, so a late-injected system_server can reach the socket as uid 1000.
-    // This is not the gate: access is controlled by the `zygisk_file` label above on an
-    // enforcing device, and by the per-action SO_PEERCRED checks in `handle_connection`.
+    // This is not the gate: access is controlled by the `0550 system:system` parent
+    // directory, the `zygote_socket` label above on an enforcing device, and the
+    // per-action SO_PEERCRED checks in `handle_connection`.
     let chmod_status = Command::new("chmod").arg("777").arg(path).status()?;
     if !chmod_status.success() {
         log::warn!("chmod 777 on {} exited with {}", path, chmod_status);
@@ -247,6 +249,95 @@ pub fn is_socket_alive(stream: &UnixStream) -> bool {
         // If `revents` has any flag other than POLLIN (e.g., POLLHUP, POLLERR), the socket is dead.
         return pfds[0].revents & !libc::POLLIN == 0;
     }
+}
+
+/// Receives a single file descriptor accompanied by a 1-byte payload via `SCM_RIGHTS`,
+/// setting `FD_CLOEXEC` atomically. Works on both `SOCK_STREAM` and `SOCK_DGRAM` Unix sockets.
+pub fn recv_fd_cloexec(sockfd: RawFd) -> std::io::Result<OwnedFd> {
+    let mut dummy: u8 = 0;
+    let mut iov = libc::iovec {
+        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+        iov_len: 1,
+    };
+    #[repr(C)]
+    union ControlBuf {
+        _align: libc::cmsghdr,
+        buf: [u8; 64],
+    }
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize };
+    assert!(cmsg_space <= 64);
+    let mut control = ControlBuf { buf: [0u8; 64] };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = unsafe { control.buf.as_mut_ptr() as *mut libc::c_void };
+    msg.msg_controllen = cmsg_space as _;
+
+    let n = loop {
+        let ret = unsafe { libc::recvmsg(sockfd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        break ret;
+    };
+
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed socket while receiving fd",
+        ));
+    }
+
+    let mut received: Option<OwnedFd> = None;
+    let mut overflow = false;
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let hdr_len = libc::CMSG_LEN(0) as usize;
+                let total_len = (*cmsg).cmsg_len as usize;
+                if total_len >= hdr_len {
+                    let nfds = (total_len - hdr_len) / std::mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(cmsg);
+                    for i in 0..nfds {
+                        let mut fd: RawFd = -1;
+                        std::ptr::copy_nonoverlapping(
+                            data.add(i * std::mem::size_of::<RawFd>()),
+                            &mut fd as *mut RawFd as *mut u8,
+                            std::mem::size_of::<RawFd>(),
+                        );
+                        if fd >= 0 {
+                            if received.is_none() {
+                                received = Some(OwnedFd::from_raw_fd(fd));
+                            } else {
+                                overflow = true;
+                                libc::close(fd);
+                            }
+                        }
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+
+    if (msg.msg_flags & libc::MSG_CTRUNC) != 0 || overflow {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control message truncated or contained extra fds",
+        ));
+    }
+
+    received.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no SCM_RIGHTS file descriptor attached",
+        )
+    })
 }
 
 // --- FFI for Android System APIs ---
