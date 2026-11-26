@@ -2,20 +2,20 @@
 # newlines and semicolons, and the tail of a split comment no longer starts with a hash,
 # so it is parsed as a rule and aborts the install.
 
-type zygisk_file file_type
-typeattribute zygisk_file mlstrustedobject
-allow domain zygisk_file dir {search getattr}
-allow domain zygisk_file sock_file {read write getattr open}
+# Use the AOSP built-in zygote_socket label on the daemon control socket instead of
+# declaring a custom SELinux type that DirtySepolicy and similar auditors probe for.
+allow zygote zygote_socket sock_file {read write getattr}
 
 # The daemon control socket is created with sockcreate=u:r:zygote:s0.
-# Native artd modules need this peer-socket permission in addition to the path permissions.
+# Native artd modules need access to the socket path and peer socket.
+allow artd zygote_socket sock_file {read write getattr}
 allow artd zygote unix_stream_socket connectto
 # Late load injects a system_server that is already running, and the injected library
 # pings the daemon before any mode-specific work, returning when that fails. It connects
 # as u:r:system_server:s0, so it needs the socket file and the listening socket. The
 # daemon creates that socket with the context u:r:zygote:s0, which is why connectto names
 # zygote rather than the daemon's own domain.
-allow system_server zygisk_file sock_file {read write}
+allow system_server zygote_socket sock_file {read write getattr}
 allow system_server zygote unix_stream_socket connectto
 
 allow zygote magisk lnk_file read
@@ -25,20 +25,14 @@ allow zygote su dir search
 allow zygote su {lnk_file file} read
 
 allow zygote zygote process execmem
-allow system_server system_server process execmem
 allow zygote tmpfs file *
 allow zygote appdomain_tmpfs file *
-# The daemon hands ZN module libraries to artd as an O_RDWR memfd, so the
-# SCM_RIGHTS receive performs a read AND write check on the tmpfs inode.
-# Without write the kernel drops the descriptor silently (dontaudited, no AVC
-# anywhere) and GetZnPlan returns 0 modules. hyos_spawner is unaffected because
-# the zygote domain holds tmpfs file *. The inode evaluates against the file
-# class on this kernel, never memfd_file, and no fd use rule is required.
-allow domain tmpfs file {open getattr map read write execute}
+# artd receives module libraries as memfds. Keep these grants scoped to its domain.
+allow artd tmpfs file {open getattr map read write execute}
+allow artd magisk memfd_file {getattr read write map execute}
+allow artd su memfd_file {getattr read write map execute}
 allow zygote magisk memfd_file {getattr read write map execute}
 allow zygote su memfd_file {getattr read write map execute}
-allow domain magisk memfd_file {getattr read write map execute}
-allow domain su memfd_file {getattr read write map execute}
 allow zygote proc file *
 allow zygote nsfs file *
 
@@ -54,6 +48,10 @@ allow system_server tmpfs file {getattr read write map execute}
 allow system_server magisk memfd_file {getattr read write map execute}
 allow system_server su memfd_file {getattr read write map execute}
 
-# The JIT cache the injected library creates for itself is labelled after its creator, so
-# in system_server it is system_server_tmpfs rather than the tmpfs above.
+# Executable stub pages and JIT caches created inside system_server. Some Zygisk modules
+# running in system_server (e.g. HMA-OSS via PanamaPort/AndroidVMTools) allocate hook
+# trampolines with anonymous mmap + mprotect(PROT_EXEC) instead of memfd, so keep execmem
+# alongside the memfd execute rules for compatibility.
+allow system_server system_server process execmem
 allow system_server system_server_tmpfs file {getattr read write map execute}
+allow system_server system_server memfd_file {getattr read write map execute}

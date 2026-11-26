@@ -108,20 +108,6 @@ void api_forEachSymbols(ZnSymbolResolver* resolver,
     });
 }
 
-int api_connectCompanion(void* handle) {
-    auto* h = static_cast<ZnModuleHandle*>(handle);
-    if (!h || !h->companion || h->target_api_version < 3 || h->lib_path.empty()) {
-        return -1;
-    }
-    return zygiskd::ConnectZnCompanion(h->lib_path);
-}
-
-// Route HYOS fallback inline hooks through the chain manager so ZN modules
-// hooking the same symbol can coexist.
-bool inlineHookRaw(void* target, void* addr, void** original) {
-    return zn::hook::inlineHook(target, addr, original);
-}
-
 // ZN API v4 Runtime: the HyperOS Rust Runtime (HYOS)
 constexpr int kMaxHyosModules = 16;
 bool g_hyos_runtime = false;
@@ -135,6 +121,27 @@ pid_t g_spawner_pid = 0;
 // and the spawner is not guaranteed to go through libc fork().
 bool hyosInChild() {
     return g_spawner_pid != 0 && static_cast<pid_t>(syscall(__NR_getpid)) != g_spawner_pid;
+}
+
+int api_connectCompanion(void* handle) {
+    auto* h = static_cast<ZnModuleHandle*>(handle);
+    if (!h || !h->companion || h->target_api_version < 3 || h->lib_path.empty()) {
+        return -1;
+    }
+    if (h->companion_broker_fd >= 0) {
+        int fd = zygiskd::ConnectZnCompanionViaBroker(h->companion_broker_fd);
+        if (fd >= 0) return fd;
+        // Specialized app children cannot connect to cp64.sock (blocked by both
+        // SEPolicy and 0550 workdir DAC), so fail closed without noisy AVC denials.
+        if (hyosInChild()) return -1;
+    }
+    return zygiskd::ConnectZnCompanion(h->lib_path);
+}
+
+// Route HYOS fallback inline hooks through the chain manager so ZN modules
+// hooking the same symbol can coexist.
+bool inlineHookRaw(void* target, void* addr, void** original) {
+    return zn::hook::inlineHook(target, addr, original);
 }
 
 typedef int (*HyosSetcontextFn)(uid_t uid, int is_system_server, const char* se_info,
@@ -178,16 +185,9 @@ bool readProcCmdline(char* out, size_t max_len) {
     return complete;
 }
 
-// The runtime hands the thread name to pthread_setname_np already cut down to its last fifteen
-// characters -- the kernel's limit, applied from the tail rather than the head -- so what the hook
-// captures is only the tail of the process's real name. /proc/self/cmdline keeps the whole name,
-// and a cmdline that ends with that captured tail is this process's name, not the spawner's.
-bool endsWithText(const char* text, const char* tail) {
-    if (!text || !tail) return false;
-    const size_t text_len = strlen(text);
-    const size_t tail_len = strlen(tail);
-    if (tail_len == 0 || tail_len > text_len) return false;
-    return memcmp(text + text_len - tail_len, tail, tail_len) == 0;
+bool isSpawnerCmdline(std::string_view cmdline) {
+    return cmdline.empty() || cmdline == "usap64" || cmdline == "usap32" ||
+           cmdline == "hyos_spawner" || cmdline.ends_with("/hyos_spawner");
 }
 
 void hyosDeliverAppSpecialized(const char* pkg_name, const char* se_info) {
@@ -196,28 +196,28 @@ void hyosDeliverAppSpecialized(const char* pkg_name, const char* se_info) {
 
     char process_name[256] = {};
     char package_name[256] = {};
-    char se_info_buf[64] = {};
-
-    // The whole name first: cmdline is the only place it survives the runtime's truncation, and it
-    // is believed only when it ends with the truncated name the runtime handed us. A child that has
-    // not been renamed yet -- cmdline still the spawner's -- therefore falls back to that truncated
-    // name instead of being reported as the spawner.
-    bool have_process_name = false;
-    if (readProcCmdline(process_name, sizeof(process_name)) && process_name[0] != '\0' &&
-        (!g_cap_has_process_name || endsWithText(process_name, g_cap_process_name))) {
-        have_process_name = true;
-    }
-    if (!have_process_name && g_cap_has_process_name && g_cap_process_name[0] != '\0') {
-        strlcpy(process_name, g_cap_process_name, sizeof(process_name));
-        have_process_name = true;
-    }
-    if (!have_process_name &&
-        (prctl(PR_GET_NAME, process_name, 0, 0, 0) != 0 || process_name[0] == '\0')) {
-        strlcpy(process_name, "hyos_app", sizeof(process_name));
-    }
+    char se_info_buf[512] = {};
 
     strlcpy(package_name, pkg_name ? pkg_name : "", sizeof(package_name));
     strlcpy(se_info_buf, se_info ? se_info : "", sizeof(se_info_buf));
+
+    char cmdline_buf[256] = {};
+    if (readProcCmdline(cmdline_buf, sizeof(cmdline_buf)) && !isSpawnerCmdline(cmdline_buf)) {
+        strlcpy(process_name, cmdline_buf, sizeof(process_name));
+    } else if (g_cap_has_process_name && g_cap_process_name[0] != '\0') {
+        std::string_view cap(g_cap_process_name);
+        std::string_view pkg(package_name);
+        // pthread_setname_np is capped at 15 chars (TASK_COMM_LEN - 1) and hyos_spawner
+        // passes the trailing 15 chars (e.g. "m.miui.weather2" for "com.miui.weather2").
+        if (cap.size() == 15 && pkg.size() > 15 && pkg.ends_with(cap)) {
+            strlcpy(process_name, package_name, sizeof(process_name));
+        } else {
+            strlcpy(process_name, g_cap_process_name, sizeof(process_name));
+        }
+    } else if (prctl(PR_GET_NAME, process_name, 0, 0, 0) != 0 || process_name[0] == '\0') {
+        strlcpy(process_name, package_name[0] != '\0' ? package_name : "hyos_app",
+                sizeof(process_name));
+    }
 
     ZnHyosAppSpecializeArgs args = {process_name, package_name, se_info_buf};
     LOGI("HYOS app specialized: process=%s package=%s se_info=%s", process_name,
@@ -253,11 +253,28 @@ int hyosSetnameHook(pthread_t thread, const char* name) {
     return ret;
 }
 
+bool g_hyos_yuki_fork_armed = false;
+
 void hyosInstallHooks();
 
 void hyosAtForkPrepare() {
     if (g_hyos_module_count > 0 && (!g_orig_setcontext || !g_orig_setname)) {
         hyosInstallHooks();
+    }
+    g_hyos_yuki_fork_armed = zn::hook::prepareFork();
+}
+
+void hyosAtForkParent() {
+    if (g_hyos_yuki_fork_armed) {
+        g_hyos_yuki_fork_armed = false;
+        zn::hook::afterForkParent();
+    }
+}
+
+void hyosAtForkChild() {
+    if (g_hyos_yuki_fork_armed) {
+        g_hyos_yuki_fork_armed = false;
+        zn::hook::afterForkChild();
     }
 }
 
@@ -344,7 +361,7 @@ int api_hyos_registerModule(const void* module) {
     if (!hyosInChild()) {
         if (!g_hyos_atfork_registered) {
             g_hyos_atfork_registered = true;
-            pthread_atfork(hyosAtForkPrepare, nullptr, nullptr);
+            pthread_atfork(hyosAtForkPrepare, hyosAtForkParent, hyosAtForkChild);
         }
         hyosInstallHooks();
     }

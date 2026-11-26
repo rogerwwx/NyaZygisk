@@ -1,11 +1,14 @@
 #include "zn_hook.hpp"
 
 #include <dlfcn.h>
+#include <linux/memfd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +24,7 @@
 #else
 #include <bytehook.h>
 #include <dobby.h>
+#include <yukiplt.h>
 #endif
 
 #include <lsplt.hpp>
@@ -34,10 +38,11 @@ namespace zn::hook {
 
 namespace {
 
-std::atomic<PltEngine> g_plt_engine{PltEngine::kByteHook};
+std::atomic<PltEngine> g_plt_engine{PltEngine::kYukiPlt};
 std::atomic<bool> g_plt_engine_initialized{false};
 
 #ifndef __riscv
+std::atomic<bool> g_yukiplt_used{false};
 std::once_flag g_bytehook_init_once;
 int g_bytehook_init_result = -1;
 
@@ -127,16 +132,16 @@ private:
 
     static bool emitTailJump(uint8_t* code, uintptr_t code_addr, uintptr_t data_addr) {
 #if defined(__aarch64__)
-        const int64_t delta = static_cast<int64_t>(data_addr) - static_cast<int64_t>(code_addr + 4);
+        const int64_t delta = static_cast<int64_t>(data_addr) - static_cast<int64_t>(code_addr + 8);
         if ((delta & 3) != 0 || delta < -(1LL << 20) || delta >= (1LL << 20)) {
             return false;
         }
         const uint32_t imm19 = static_cast<uint32_t>(delta >> 2) & 0x7ffffu;
         const uint32_t insns[4] = {
             0xd50324dfu,                     // bti jc (NOP without FEAT_BTI)
+            0xd50339bfu,                     // dmb ishld (orders GOT load before slot load)
             0x58000010u | (imm19 << 5),      // ldr x16, [pc, #delta]
             0xd61f0200u,                     // br  x16 (BTI-c compatible)
-            0xd503201fu,                     // nop
         };
         memcpy(code, insns, sizeof(insns));
         return true;
@@ -199,6 +204,38 @@ private:
 #endif
     }
 
+    static bool mapCodeViaMemfd(uintptr_t code_base, size_t pg) {
+        int mfd = static_cast<int>(syscall(__NR_memfd_create, "jit-cache", MFD_CLOEXEC));
+        if (mfd < 0) {
+            PLOGE("ZN hook: memfd_create for stub slab failed");
+            return false;
+        }
+        const auto* src = reinterpret_cast<const uint8_t*>(code_base);
+        size_t written = 0;
+        while (written < pg) {
+            ssize_t n = write(mfd, src + written, pg - written);
+            if (n > 0) {
+                written += static_cast<size_t>(n);
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                PLOGE("ZN hook: write stub slab memfd failed");
+                close(mfd);
+                return false;
+            }
+        }
+        void* rx = mmap(reinterpret_cast<void*>(code_base), pg, PROT_READ | PROT_EXEC,
+                        MAP_PRIVATE | MAP_FIXED, mfd, 0);
+        close(mfd);
+        if (rx == MAP_FAILED) {
+            PLOGE("ZN hook: mmap(PROT_READ|PROT_EXEC) stub slab memfd failed");
+            return false;
+        }
+        __builtin___clear_cache(reinterpret_cast<char*>(code_base),
+                                reinterpret_cast<char*>(code_base + pg));
+        return true;
+    }
+
     static bool allocateSlabLocked() {
         long raw_pg = sysconf(_SC_PAGESIZE);
         const size_t pg = raw_pg > 0 ? static_cast<size_t>(raw_pg) : 4096;
@@ -228,9 +265,13 @@ private:
                                 reinterpret_cast<char*>(code_base + pg));
 
         if (mprotect(reinterpret_cast<void*>(code_base), pg, PROT_READ | PROT_EXEC) != 0) {
-            PLOGE("ZN hook: mprotect(PROT_READ|PROT_EXEC) on stub slab failed");
-            munmap(mem, pg * 2);
-            return false;
+            // Restricted domains such as system_server deny anonymous execmem; fall back to
+            // a file-backed RX mapping from a closed memfd ("jit-cache") while preserving
+            // the adjacent anonymous RW slot page at code_base + pg.
+            if (!mapCodeViaMemfd(code_base, pg)) {
+                munmap(mem, pg * 2);
+                return false;
+            }
         }
 
         register_cfi_unchecked(code_base, pg);
@@ -343,6 +384,7 @@ struct PltChain {
     StubSlot head_slot;
 #ifndef __riscv
     bytehook_stub_t bh_stub = nullptr;
+    yukiplt_c_handle yuki_handle{0};
 #endif
     // Front = most recently installed hook (invoked first).
     std::deque<PltNode> nodes;
@@ -388,10 +430,93 @@ bool lspltPatchRaw(dev_t dev, ino_t inode, const char* symbol, void* replacement
     return true;
 }
 
-bool installPltBackend(const znn::MapEntry& entry, const char* symbol, void* got_target,
-                       void** orig_out, PltChain& chain) {
 #ifndef __riscv
-    if (getPltEngine() == PltEngine::kByteHook && bytehookInit()) {
+bool yukipltInstall(const znn::MapEntry& entry, uintptr_t base, const char* symbol,
+                    void* got_target, void** orig_out, PltChain& chain) {
+    // Mark YukiPLT touched before the first C API entry point because even
+    // yukiplt_c_image_containing latches the owning PID inside OperationGuard.
+    g_yukiplt_used.store(true, std::memory_order_release);
+
+    yukiplt_c_image image{};
+    yukiplt_c_error err =
+        yukiplt_c_image_containing(reinterpret_cast<const void*>(entry.start), &image);
+    if (err.code != YUKIPLT_C_SUCCESS && base != 0 && base != entry.start) {
+        err = yukiplt_c_image_containing(reinterpret_cast<const void*>(base), &image);
+    }
+    if (err.code != YUKIPLT_C_SUCCESS) {
+        LOGW("ZN pltHook %s: YukiPLT could not resolve image %s (%s), falling back to LSPlt",
+             symbol, entry.path.c_str(), yukiplt_c_error_name(err.code));
+        return false;
+    }
+
+    yukiplt_c_handle handle{0};
+    const yukiplt_c_selector sel = YUKIPLT_C_SELECTOR(symbol);
+    err = yukiplt_c_hook(&image, &sel, got_target, orig_out, &handle, nullptr);
+    if (err.code == YUKIPLT_C_SYMBOL_NOT_FOUND) {
+        // Retry with opt-in GLOB_DAT + APS2 packed relocation scan (e.g. -fno-plt targets).
+        handle.token = 0;
+        const yukiplt_c_function_selector fsel = YUKIPLT_C_FUNCTION_SELECTOR(symbol);
+        err = yukiplt_c_hook_function(&image, &fsel, got_target, orig_out, &handle, nullptr);
+    }
+    auto releaseHandle = [](yukiplt_c_handle& h) {
+        if (h.token == 0) return;
+        yukiplt_c_unhook(&h, nullptr, 0);
+        if (h.token != 0) {
+            yukiplt_c_abandon(&h);
+            h.token = 0;
+        }
+    };
+
+    if (err.code != YUKIPLT_C_SUCCESS) {
+        releaseHandle(handle);
+        if (orig_out != nullptr) {
+            __atomic_store_n(orig_out, nullptr, __ATOMIC_RELEASE);
+        }
+        LOGW("ZN pltHook %s: YukiPLT hook failed for %s (%s, errno=%d), falling back to LSPlt",
+             symbol, entry.path.c_str(), yukiplt_c_error_name(err.code), err.sys_errno);
+        return false;
+    }
+
+    void* orig = orig_out != nullptr ? yukiplt_c_load_original(orig_out) : nullptr;
+    if (orig == nullptr) {
+        LOGW("ZN pltHook %s: YukiPLT returned null original for %s, falling back to LSPlt", symbol,
+             entry.path.c_str());
+        releaseHandle(handle);
+        return false;
+    }
+
+    chain.backend = PltEngine::kYukiPlt;
+    chain.yuki_handle = handle;
+    chain.real_orig = orig;
+    return true;
+}
+
+const char* pltEngineName(PltEngine e) {
+    switch (e) {
+    case PltEngine::kYukiPlt:
+        return "YukiPLT";
+    case PltEngine::kByteHook:
+        return "ByteHook";
+    case PltEngine::kLsplt:
+        return "LSPlt";
+    }
+    return "YukiPLT";
+}
+#else
+const char* pltEngineName(PltEngine e) {
+    return e == PltEngine::kLsplt ? "LSPlt" : "LSPlt (riscv64 fallback)";
+}
+#endif
+
+bool installPltBackend(const znn::MapEntry& entry, uintptr_t base, const char* symbol,
+                       void* got_target, void** orig_out, PltChain& chain) {
+#ifndef __riscv
+    const PltEngine engine = getPltEngine();
+    if (engine == PltEngine::kYukiPlt) {
+        if (yukipltInstall(entry, base, symbol, got_target, orig_out, chain)) {
+            return true;
+        }
+    } else if (engine == PltEngine::kByteHook && bytehookInit()) {
         const bytehook_stub_t stub =
             bytehook_hook_single(entry.path.c_str(), nullptr, symbol, got_target,
                                  bytehookHookedCallback, orig_out);
@@ -411,6 +536,8 @@ bool installPltBackend(const znn::MapEntry& entry, const char* symbol, void* got
                  symbol, entry.path.c_str());
         }
     }
+#else
+    (void) base;
 #endif
 
     if (lspltPatchRaw(entry.dev, entry.inode, symbol, got_target, orig_out)) {
@@ -423,6 +550,16 @@ bool installPltBackend(const znn::MapEntry& entry, const char* symbol, void* got
 
 bool uninstallPltBackend(const PltKey& key, PltChain& chain) {
 #ifndef __riscv
+    if (chain.backend == PltEngine::kYukiPlt && chain.yuki_handle.token != 0) {
+        const yukiplt_c_error err = yukiplt_c_unhook(&chain.yuki_handle, nullptr, 0);
+        if (err.code != YUKIPLT_C_SUCCESS && err.code != YUKIPLT_C_IMAGE_INVALIDATED) {
+            LOGE("ZN pltHook %s: yukiplt_c_unhook failed: %s (errno=%d)", key.symbol.c_str(),
+                 yukiplt_c_error_name(err.code), err.sys_errno);
+            return false;
+        }
+        chain.yuki_handle.token = 0;
+        return true;
+    }
     if (chain.backend == PltEngine::kByteHook && chain.bh_stub != nullptr) {
         if (bytehook_unhook(chain.bh_stub) != 0) {
             LOGE("ZN pltHook %s: bytehook_unhook failed", key.symbol.c_str());
@@ -442,29 +579,41 @@ void setPltEngine(PltEngine e) {
     g_plt_engine_initialized.store(true, std::memory_order_release);
 }
 
+#define _ZN_HOOK_STR(x) #x
+#define ZN_HOOK_STR(x) _ZN_HOOK_STR(x)
+#ifdef WORK_DIRECTORY
+constexpr const char* kZnConfigPath = ZN_HOOK_STR(WORK_DIRECTORY) "/config.prop";
+#else
+constexpr const char* kZnConfigPath = "/data/system_de/nyazygisk/config.prop";
+#endif
+
 void initPltEngineFromConfig() {
     g_plt_engine_initialized.store(true, std::memory_order_release);
-    FILE* fp = fopen("/data/system/nyazygisk/config.prop", "re");
-    if (!fp) return;
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        char* end = line + strlen(line);
-        while (end > line &&
-               (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
-            *--end = '\0';
+    PltEngine selected = PltEngine::kYukiPlt;
+    FILE* fp = fopen(kZnConfigPath, "re");
+    if (fp) {
+        char line[128];
+        while (fgets(line, sizeof(line), fp)) {
+            char* end = line + strlen(line);
+            while (end > line &&
+                   (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) {
+                *--end = '\0';
+            }
+            if (strcmp(line, "plt_engine=lsplt") == 0) {
+                selected = PltEngine::kLsplt;
+                break;
+            } else if (strcmp(line, "plt_engine=bytehook") == 0) {
+                selected = PltEngine::kByteHook;
+                break;
+            } else if (strcmp(line, "plt_engine=yukiplt") == 0) {
+                selected = PltEngine::kYukiPlt;
+                break;
+            }
         }
-        if (strcmp(line, "plt_engine=lsplt") == 0) {
-            g_plt_engine.store(PltEngine::kLsplt, std::memory_order_release);
-            break;
-        } else if (strcmp(line, "plt_engine=bytehook") == 0) {
-            g_plt_engine.store(PltEngine::kByteHook, std::memory_order_release);
-            break;
-        }
+        fclose(fp);
     }
-    fclose(fp);
-    LOGI("ZN hook: selected PLT engine: %s",
-         g_plt_engine.load(std::memory_order_acquire) == PltEngine::kByteHook ? "ByteHook"
-                                                                              : "LSPlt");
+    g_plt_engine.store(selected, std::memory_order_release);
+    LOGI("ZN hook: selected PLT engine: %s", pltEngineName(selected));
 }
 
 PltEngine getPltEngine() {
@@ -472,6 +621,33 @@ PltEngine getPltEngine() {
         initPltEngineFromConfig();
     }
     return g_plt_engine.load(std::memory_order_acquire);
+}
+
+bool prepareFork() {
+#ifndef __riscv
+    if (!g_yukiplt_used.load(std::memory_order_acquire)) return false;
+    const yukiplt_c_error err = yukiplt_c_prepare_fork();
+    if (err.code != YUKIPLT_C_SUCCESS) {
+        LOGW("ZN hook: yukiplt_c_prepare_fork failed: %s (errno=%d)",
+             yukiplt_c_error_name(err.code), err.sys_errno);
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+void afterForkParent() {
+#ifndef __riscv
+    yukiplt_c_after_fork_parent();
+#endif
+}
+
+void afterForkChild() {
+#ifndef __riscv
+    yukiplt_c_after_fork_child();
+#endif
 }
 
 bool hasActiveHooks() {
@@ -646,9 +822,26 @@ bool pltHook(void* base, const char* symbol, void* hook, void** original) {
                 if (chain.uses_stub) {
                     __atomic_store_n(chain.head_slot.data, chain.real_orig, __ATOMIC_RELEASE);
                 }
+                const bool was_yuki = (chain.backend == PltEngine::kYukiPlt);
                 bool ok = uninstallPltBackend(key, chain);
                 void* orig = chain.real_orig;
                 g_plt_chains.erase(it);
+#ifndef __riscv
+                if (was_yuki) {
+                    bool any_yuki = false;
+                    for (const auto& [_, remaining] : g_plt_chains) {
+                        if (remaining.backend == PltEngine::kYukiPlt) {
+                            any_yuki = true;
+                            break;
+                        }
+                    }
+                    if (!any_yuki) {
+                        yukiplt_c_trim_idle_storage();
+                    }
+                }
+#else
+                (void) was_yuki;
+#endif
                 if (ok && original != nullptr) *original = orig;
                 return ok;
             }
@@ -712,15 +905,22 @@ bool pltHook(void* base, const char* symbol, void* hook, void** original) {
 
         // No-execmem fallback: directly chain GOT via LSPlt.
 #ifndef __riscv
-        if (chain.backend == PltEngine::kByteHook && chain.bh_stub != nullptr) {
-            // ByteHook manual mode forbids duplicate hooks; hand off cleanly to LSPlt.
+        if ((chain.backend == PltEngine::kYukiPlt && chain.yuki_handle.token != 0) ||
+            (chain.backend == PltEngine::kByteHook && chain.bh_stub != nullptr)) {
+            // Single-owner backends forbid duplicate hooks on the same slot; hand off cleanly
+            // to LSPlt without rewriting GOT back to real_orig.
             void* prev_head = chain.nodes.front().handler;
             if (!lspltPatchRaw(entry->dev, entry->inode, symbol, hook, nullptr)) {
                 return false;
             }
-            // Note: do not call bytehook_unhook here because it would overwrite GOT back
-            // to real_orig; detach ownership and let LSPlt own final restoration.
-            chain.bh_stub = nullptr;
+            if (chain.backend == PltEngine::kYukiPlt && chain.yuki_handle.token != 0) {
+                yukiplt_c_abandon(&chain.yuki_handle);
+                chain.yuki_handle.token = 0;
+            } else {
+                // Do not call bytehook_unhook here because it would overwrite GOT back
+                // to real_orig; detach ownership and let LSPlt own final restoration.
+                chain.bh_stub = nullptr;
+            }
             chain.backend = PltEngine::kLsplt;
             if (original != nullptr) *original = prev_head;
             chain.nodes.push_front(PltNode{hook, {}, prev_head});
@@ -748,7 +948,7 @@ bool pltHook(void* base, const char* symbol, void* hook, void** original) {
         chain.uses_stub = true;
         chain.head_slot = head_slot;
         if (original != nullptr) *original = next_slot.code;
-        if (!installPltBackend(*entry, symbol, head_slot.code, next_slot.data, chain)) {
+        if (!installPltBackend(*entry, b, symbol, head_slot.code, next_slot.data, chain)) {
             if (original != nullptr) *original = nullptr;
             return false;
         }
@@ -761,12 +961,13 @@ bool pltHook(void* base, const char* symbol, void* hook, void** original) {
 
     // No execmem available (e.g. restricted domain): install direct GOT hook without stubs.
     void* direct_orig = nullptr;
-    if (!installPltBackend(*entry, symbol, hook, &direct_orig, chain)) {
+    void** orig_slot = (original != nullptr) ? original : &direct_orig;
+    *orig_slot = nullptr;
+    if (!installPltBackend(*entry, b, symbol, hook, orig_slot, chain)) {
         return false;
     }
     chain.uses_stub = false;
-    if (original != nullptr) *original = direct_orig;
-    chain.nodes.push_front(PltNode{hook, {}, direct_orig});
+    chain.nodes.push_front(PltNode{hook, {}, chain.real_orig});
     g_plt_chains.emplace(key, std::move(chain));
     LOGI("ZN pltHook %s: installed direct hook %p (no execmem)", symbol, hook);
     return true;

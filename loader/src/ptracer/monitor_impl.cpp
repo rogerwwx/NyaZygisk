@@ -53,7 +53,9 @@ void AppMonitor::write_abi_status_section(std::string &status_text, const Status
         status_text += "\ndaemon_";
         status_text += abi_name;
         status_text += "_status=";
-        if (daemon_status.daemon_running) {
+        if (tracing_state_ == EXITING) {
+            status_text += "exited";
+        } else if (daemon_status.daemon_running) {
             status_text += "running";
             if (!daemon_status.daemon_info.empty()) {
                 status_text += "\n";
@@ -298,13 +300,15 @@ void AppMonitor::request_stop(std::string reason) {
 
 void AppMonitor::request_exit() {
     LOGI("prepare for exit ...");
+    std::string sock_path = zygiskd::GetTmpPath() + "/" + AppMonitor::SOCKET_NAME;
+    unlink(sock_path.c_str());
     tracing_state_ = EXITING;
     monitor_stop_reason_ = "user requested";
     update_status();
     event_loop_.Stop();
 }
 
-void AppMonitor::request_rearm() {
+RearmResult AppMonitor::request_rearm() {
     LOGI("rearm requested");
 
     // A rearm asks for injection, so lift a stop the monitor put itself into after a
@@ -313,12 +317,14 @@ void AppMonitor::request_rearm() {
         request_start();
     }
 
-    if (!zygote_.rearm()) {
+    auto result = zygote_.rearm();
+    if (result == RearmResult::Failed) {
         request_stop("rearm failed");
-        return;
+        return result;
     }
 
     update_status();
+    return result;
 }
 
 void AppMonitor::notify_init_detached() {
@@ -402,11 +408,14 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
         }
         buf_.resize(real_size);
         MsgHead &full_msg = *reinterpret_cast<MsgHead *>(buf_.data());
-        nread = recv(sock_fd_, &full_msg, real_size, 0);
+        struct sockaddr_un peer{};
+        socklen_t peer_len = sizeof(peer);
+        nread = recvfrom(sock_fd_, &full_msg, real_size, 0,
+                         reinterpret_cast<struct sockaddr *>(&peer), &peer_len);
         if (nread == -1) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            PLOGE("recv(read)");
+            PLOGE("recvfrom(read)");
             break;
         }
         if (static_cast<size_t>(nread) != real_size) {
@@ -424,9 +433,18 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
         case EXIT:
             monitor_.request_exit();
             break;
-        case REARM:
-            monitor_.request_rearm();
+        case REARM: {
+            auto res = monitor_.request_rearm();
+            if (peer_len > sizeof(sa_family_t)) {
+                auto reply = static_cast<uint8_t>(res);
+                if (sendto(sock_fd_, &reply, sizeof(reply), MSG_DONTWAIT,
+                           reinterpret_cast<const struct sockaddr *>(&peer), peer_len) == -1) {
+                    LOGW("SocketHandler: sendto rearm reply failed: %s (%d)", strerror(errno),
+                         errno);
+                }
+            }
             break;
+        }
         case ZYGOTE_INJECTED:
             monitor_.get_abi_manager().notify_injected();
             monitor_.update_status();
@@ -475,7 +493,20 @@ bool AppMonitor::SigChldHandler::Init() {
     }
     // Only one process may trace init, so this is also what settles a race between two
     // monitors starting at once: the one that loses cannot do its job and says so.
-    if (ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK) == -1) {
+    // Retry briefly on EPERM in case the previous monitor just unlinked its socket on the
+    // way out and the kernel is still finishing exit_ptrace() in do_exit().
+    bool seized = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK) == 0) {
+            seized = true;
+            break;
+        }
+        if (errno != EPERM) {
+            break;
+        }
+        usleep(25 * 1000);
+    }
+    if (!seized) {
         PLOGE("seize init");
         return false;
     }
@@ -812,7 +843,24 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
         // Force the process into a standard SIGSTOP state.
         kill(pid, SIGSTOP);
         ptrace(PTRACE_CONT, pid, 0, 0);
-        while (waitpid(pid, &status, __WALL) == -1 && errno == EINTR) {}
+        for (;;) {
+            while (waitpid(pid, &status, __WALL) == -1 && errno == EINTR) {}
+            if (stopped_with(status, SIGSTOP, 0)) {
+                break;
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                break;
+            }
+            if (WIFSTOPPED(status)) {
+                int sig = (WPTEVENT(status) == 0) ? WSTOPSIG(status) : 0;
+                if (sig == SIGSTOP || sig == SIGTRAP) sig = 0;
+                LOGV("forwarding intermediate stop %s while halting target %d",
+                     parse_status(status).c_str(), pid);
+                ptrace(PTRACE_CONT, pid, 0, sig);
+                continue;
+            }
+            break;
+        }
 
         if (stopped_with(status, SIGSTOP, 0)) {
             LOGV("target %d halted, detaching monitor to allow injector seize", pid);

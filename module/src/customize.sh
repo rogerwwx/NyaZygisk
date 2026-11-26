@@ -112,7 +112,6 @@ extract "$ZIPFILE" 'post-fs-data.sh'           "$MODPATH"
 extract "$ZIPFILE" 'late-load.sh'              "$MODPATH"
 extract "$ZIPFILE" 'post-mount.sh'             "$MODPATH"
 extract "$ZIPFILE" 'hotinstall.sh'            "$MODPATH"
-extract "$ZIPFILE" 'zygisk-init.sh'            "$MODPATH"
 extract "$ZIPFILE" 'service.sh'                "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'              "$MODPATH"
 extract "$ZIPFILE" 'emulated-soft-reboot.sh'   "$MODPATH"
@@ -122,46 +121,25 @@ mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 WORK_DIR="@WORK_DIRECTORY@"
 
-# Migrate WebUI config and spoof.prop to work directory
 mkdir -p "$WORK_DIR"
-chmod 755 "$WORK_DIR"
+chmod 0550 "$WORK_DIR"
 chcon u:object_r:system_file:s0 "$WORK_DIR"
 chown system:system "$WORK_DIR"
 
-if [ ! -f "$WORK_DIR/config.prop" ]; then
-  if [ -f "/data/adb/nyazygisk/config.prop" ]; then
-    ui_print "- Migrating WebUI config from /data/adb/nyazygisk"
-    cp -af "/data/adb/nyazygisk/config.prop" "$WORK_DIR/config.prop"
-  elif [ -f "/data/adb/modules/zygisksu/config.prop" ]; then
-    ui_print "- Migrating WebUI config from /data/adb/modules/zygisksu"
-    cp -af "/data/adb/modules/zygisksu/config.prop" "$WORK_DIR/config.prop"
-  fi
-fi
-
 if [ -f "$WORK_DIR/config.prop" ]; then
-  chmod 644 "$WORK_DIR/config.prop"
+  chmod 0644 "$WORK_DIR/config.prop"
   chcon u:object_r:system_file:s0 "$WORK_DIR/config.prop"
   chown system:system "$WORK_DIR/config.prop"
 fi
 
-if [ ! -f "$WORK_DIR/spoof.prop" ]; then
-  if [ -f "/data/adb/modules/zygisksu/spoof.prop" ]; then
-    ui_print "- Migrating spoof.prop from /data/adb/modules/zygisksu"
-    cp -af "/data/adb/modules/zygisksu/spoof.prop" "$WORK_DIR/spoof.prop"
-  elif [ -f "$MODPATH/spoof.prop" ]; then
-    cp -af "$MODPATH/spoof.prop" "$WORK_DIR/spoof.prop"
-  fi
+if [ ! -f "$WORK_DIR/spoof.prop" ] && [ -f "$MODPATH/spoof.prop" ]; then
+  cp -af "$MODPATH/spoof.prop" "$WORK_DIR/spoof.prop"
 fi
 
 if [ -f "$WORK_DIR/spoof.prop" ]; then
-  chmod 644 "$WORK_DIR/spoof.prop"
+  chmod 0600 "$WORK_DIR/spoof.prop"
   chcon u:object_r:system_file:s0 "$WORK_DIR/spoof.prop"
-  chown 0:0 "$WORK_DIR/spoof.prop"
-fi
-
-# Clean up legacy /data/adb/nyazygisk directory if present
-if [ -d "/data/adb/nyazygisk" ]; then
-  rm -rf "/data/adb/nyazygisk"
+  chown root:root "$WORK_DIR/spoof.prop"
 fi
 
 mkdir "$MODPATH/bin"
@@ -203,6 +181,8 @@ set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm_recursive "$MODPATH/lib" 0 0 0755 0644 u:object_r:system_lib_file:s0
 set_perm_recursive "$MODPATH/lib64" 0 0 0755 0644 u:object_r:system_lib_file:s0
 set_perm_recursive "$MODPATH/webroot" 0 0 0755 0644
+set_perm "$MODPATH/spoof.prop" 0 0 0600
+set_perm "$MODPATH/late-load.sh" 0 0 0755
 
 # If Huawei's Maple is enabled, system_server is created with a special way which is out of Zygisk's control
 HUAWEI_MAPLE_ENABLED=$(grep_prop ro.maple.enable)
@@ -211,13 +191,12 @@ if [ "$HUAWEI_MAPLE_ENABLED" = "1" ]; then
   echo "ro.maple.enable=0" >>"$MODPATH/system.prop"
 fi
 
-# NeoZygisk is binaries and scripts only, so none of what it installs waits for a boot
-# stage: hotinstall.sh replaces the running monitor, which is all an update needs.
-# The Maple workaround above is the one exception. KernelSU loads a
-# system.prop from post-fs-data and from late load, but its hot-install path deliberately
-# loads none, so a build that wrote one has to take the reboot.
-if [ "$KSU" ] && [ ! -f "$MODPATH/system.prop" ]; then
-  ui_print "- Applying without a reboot"
+# Only hot-install on a temp-root (KSU_LATE_LOAD=1) fresh install where no previous
+# NyaZygisk session is running and no system.prop needs a boot stage. Any in-place
+# upgrade or persistent-root install requires a reboot so a fresh zygote maps the new
+# libzygisk.so cleanly alongside the new monitor and daemon.
+if [ "$KSU" ] && [ "$KSU_LATE_LOAD" = "1" ] && [ ! -d "/data/adb/modules/$MODID" ] && [ ! -f "$MODPATH/system.prop" ]; then
+  ui_print "- Temp-root fresh install: applying without a reboot"
   export MODULE_HOT_INSTALL_REQUEST=true
   export MODULE_HOT_RUN_SCRIPT=hotinstall.sh
 fi
